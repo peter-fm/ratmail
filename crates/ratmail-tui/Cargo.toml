@@ -16,6 +16,7 @@ ratmail-mail = { path = "../ratmail-mail" }
 ratmail-render = { path = "../ratmail-render" }
 ratatui-image.workspace = true
 image.workspace = true
+open.workspace = true
 
 [[bin]]
 name = "ratmail"

@@ -130,78 +130,93 @@ impl SqliteMailStore {
             .bind("personal@example.com")
             .execute(&self.pool)
             .await?;
-
-            let folders = vec![
-                (1, "INBOX", 42),
-                (2, "Today", 0),
-                (3, "Starred", 0),
-                (4, "Sent", 0),
-                (5, "Drafts", 0),
-                (6, "Archive", 0),
-                (7, "Work/INBOX", 3),
-                (8, "Work/Sent", 0),
-            ];
-
-            for (id, name, unread) in folders {
-                sqlx::query(
-                    "INSERT INTO folders (id, account_id, name, unread) VALUES (?, 1, ?, ?)",
-                )
-                .bind(id)
-                .bind(name)
-                .bind(unread)
-                .execute(&self.pool)
-                .await?;
-            }
-
-            let messages = vec![
-                (1, "2026-02-03 10:31", "Alex Chen", "Re: Proposal", 1, "Thanks - attached is the updated..."),
-                (2, "2026-02-03 09:58", "GitHub", "Security alert", 1, "We detected a new sign-in..."),
-                (3, "2026-02-03 09:12", "HR", "Benefits 2026", 0, "Open enrollment starts..."),
-                (4, "2026-02-03 08:44", "Newsletter", "Weekly digest", 1, "Top stories this week..."),
-                (5, "2026-02-02 17:22", "Billing", "Invoice #1931", 0, "Your invoice is ready..."),
-                (6, "2026-02-02 14:03", "Sam", "Lunch?", 0, "Want to grab lunch..."),
-            ];
-
-            for (id, date, from, subject, unread, preview) in messages {
-                sqlx::query(
-                    "INSERT INTO messages (id, account_id, folder_id, date, from_addr, subject, unread, preview)
-                     VALUES (?, 1, 1, ?, ?, ?, ?, ?)",
-                )
-                .bind(id)
-                .bind(date)
-                .bind(from)
-                .bind(subject)
-                .bind(unread)
-                .bind(preview)
-                .execute(&self.pool)
-                .await?;
+        } else {
+            let demo = sqlx::query_as::<_, (String,)>(
+                "SELECT name FROM accounts WHERE id = 1",
+            )
+            .fetch_one(&self.pool)
+            .await?
+            .0 == "personal@example.com";
+            if demo {
+                sqlx::query("DELETE FROM cache_tiles").execute(&self.pool).await?;
+                sqlx::query("DELETE FROM cache_html").execute(&self.pool).await?;
+                sqlx::query("DELETE FROM cache_text").execute(&self.pool).await?;
+                sqlx::query("DELETE FROM bodies").execute(&self.pool).await?;
+                sqlx::query("DELETE FROM messages").execute(&self.pool).await?;
+                sqlx::query("DELETE FROM folders").execute(&self.pool).await?;
             }
         }
 
-        let cache_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cache_text")
-            .fetch_one(&self.pool)
-            .await?;
-        if cache_count.0 == 0 {
-            let bodies = vec![
-                (1, "Thanks - this looks good overall.\n\nI've added comments to section 3 regarding timelines."),
-                (2, "We detected a new sign-in to your account. If this was you, no action is needed."),
-                (3, "Open enrollment starts next week. Please review the benefits guide."),
-                (4, "Here is your weekly digest. Top stories and updates inside."),
-                (5, "Your invoice is ready. Please remit payment by the due date."),
-                (6, "Want to grab lunch today? I am free around noon."),
-            ];
+        let folders = vec![
+            (1, "INBOX", 42),
+            (2, "Sent", 0),
+            (3, "Drafts", 1),
+            (4, "Archive", 0),
+        ];
 
-            for (message_id, body) in bodies {
-                sqlx::query(
-                    "INSERT INTO cache_text (message_id, width_cols, text, updated_at)
-                     VALUES (?, ?, ?, '2026-02-03T12:00:00Z')",
-                )
-                .bind(message_id)
-                .bind(DEFAULT_TEXT_WIDTH)
-                .bind(body)
-                .execute(&self.pool)
-                .await?;
-            }
+        for (id, name, unread) in folders {
+            sqlx::query(
+                "INSERT INTO folders (id, account_id, name, unread) VALUES (?, 1, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET name = excluded.name, unread = excluded.unread",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(unread)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        let messages = vec![
+            (1, 1, "2026-02-03 10:31", "Alex Chen", "Re: Proposal", 1, "Thanks - attached is the updated..."),
+            (2, 1, "2026-02-03 09:58", "GitHub", "Security alert", 1, "We detected a new sign-in..."),
+            (3, 1, "2026-02-03 09:12", "HR", "Benefits 2026", 0, "Open enrollment starts..."),
+            (4, 1, "2026-02-03 08:44", "Newsletter", "Weekly digest", 1, "Top stories this week..."),
+            (5, 1, "2026-02-02 17:22", "Billing", "Invoice #1931", 0, "Your invoice is ready..."),
+            (6, 1, "2026-02-02 14:03", "Sam", "Lunch?", 0, "Want to grab lunch..."),
+            (7, 3, "2026-02-03 11:11", "Me", "Draft: Proposal follow-up", 0, "Draft message..."),
+        ];
+
+        for (id, folder_id, date, from, subject, unread, preview) in messages {
+            sqlx::query(
+                "INSERT INTO messages (id, account_id, folder_id, date, from_addr, subject, unread, preview)
+                 VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET folder_id = excluded.folder_id, date = excluded.date,
+                 from_addr = excluded.from_addr, subject = excluded.subject, unread = excluded.unread,
+                 preview = excluded.preview",
+            )
+            .bind(id)
+            .bind(folder_id)
+            .bind(date)
+            .bind(from)
+            .bind(subject)
+            .bind(unread)
+            .bind(preview)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        let bodies = vec![
+            (1, "Thanks - this looks good overall.\n\nI've added comments to section 3 regarding timelines."),
+            (2, "We detected a new sign-in to your account. If this was you, no action is needed."),
+            (3, "Open enrollment starts next week. Please review the benefits guide."),
+            (4, "Here is your weekly digest. Top stories and updates inside."),
+            (5, "Your invoice is ready. Please remit payment by the due date."),
+            (6, "Want to grab lunch today? I am free around noon."),
+            (7, "Draft message..."),
+        ];
+
+        for (message_id, body) in bodies {
+            sqlx::query(
+                "INSERT INTO cache_text (message_id, width_cols, text, updated_at)
+                 VALUES (?, ?, ?, '2026-02-03T12:00:00Z')
+                 ON CONFLICT(message_id, width_cols)
+                 DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at",
+            )
+            .bind(message_id)
+            .bind(DEFAULT_TEXT_WIDTH)
+            .bind(body)
+            .execute(&self.pool)
+            .await?;
         }
 
         let raw_messages = vec![
@@ -272,6 +287,14 @@ Subject: Lunch?\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 Want to grab lunch today? I am free around noon.\r\n",
+            ),
+            (
+                7,
+                "From: Me <me@example.com>\r\n\
+Subject: Draft: Proposal follow-up\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Draft message...\r\n",
             ),
         ];
 
@@ -349,7 +372,7 @@ Want to grab lunch today? I am free around noon.\r\n",
 
 #[async_trait]
 impl MailStore for SqliteMailStore {
-    async fn load_snapshot(&self, account_id: i64, folder_id: i64) -> Result<StoreSnapshot> {
+    async fn load_snapshot(&self, account_id: i64, _folder_id: i64) -> Result<StoreSnapshot> {
         let account = sqlx::query_as::<_, (i64, String, String)>(
             "SELECT id, name, address FROM accounts WHERE id = ?",
         )
@@ -366,9 +389,9 @@ impl MailStore for SqliteMailStore {
 
         let messages = sqlx::query_as::<_, (i64, i64, String, String, String, i64, String)>(
             "SELECT id, folder_id, date, from_addr, subject, unread, preview
-             FROM messages WHERE folder_id = ? ORDER BY id",
+             FROM messages WHERE account_id = ? ORDER BY id",
         )
-        .bind(folder_id)
+        .bind(account_id)
         .fetch_all(&self.pool)
         .await?;
 

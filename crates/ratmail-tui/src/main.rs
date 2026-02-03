@@ -18,7 +18,7 @@ use ratatui::{
 };
 
 use ratmail_core::{
-    MailStore, MessageDetail, MessageSummary, SqliteMailStore, StoreSnapshot, TileMeta,
+    Folder, MailStore, MessageDetail, MessageSummary, SqliteMailStore, StoreSnapshot, TileMeta,
     DEFAULT_TEXT_WIDTH,
 };
 use ratmail_content::{extract_attachments, extract_display, prepare_html};
@@ -28,7 +28,7 @@ use std::sync::Arc;
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
-const RENDER_DEBOUNCE: Duration = Duration::from_millis(120);
+const RENDER_DEBOUNCE: Duration = Duration::from_millis(0);
 const RENDER_PREFETCH_NEXT: usize = 2;
 const RENDER_PREFETCH_PREV: usize = 1;
 const TILE_CACHE_BUDGET_BYTES: i64 = 256 * 1024 * 1024;
@@ -63,6 +63,12 @@ enum Mode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Folders,
+    Messages,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Text,
     Rendered,
@@ -70,8 +76,10 @@ enum ViewMode {
 
 struct App {
     mode: Mode,
+    focus: Focus,
     view_mode: ViewMode,
     store: StoreSnapshot,
+    folder_index: usize,
     message_index: usize,
     last_tick: Instant,
     sync_status: String,
@@ -100,6 +108,7 @@ struct App {
     protocol_cache: HashMap<(i64, usize), StatefulProtocol>,
     protocol_cache_lru: VecDeque<(i64, usize)>,
     last_render_area: Option<(u16, u16)>,
+    link_index: usize,
 }
 
 impl App {
@@ -117,8 +126,10 @@ impl App {
     ) -> Self {
         let mut app = Self {
             mode: Mode::List,
+            focus: Focus::Messages,
             view_mode: ViewMode::Rendered,
             store,
+            folder_index: 0,
             message_index: 0,
             last_tick: Instant::now(),
             sync_status: "idle".to_string(),
@@ -147,6 +158,7 @@ impl App {
             protocol_cache: HashMap::new(),
             protocol_cache_lru: VecDeque::new(),
             last_render_area: None,
+            link_index: 0,
         };
         if app.view_mode == ViewMode::Rendered {
             app.schedule_render();
@@ -155,12 +167,26 @@ impl App {
     }
 
     fn selected_message(&self) -> Option<&MessageSummary> {
-        self.store.messages.get(self.message_index)
+        let messages = self.visible_messages();
+        messages.get(self.message_index).copied()
     }
 
     fn selected_detail(&self) -> Option<&MessageDetail> {
         let message_id = self.selected_message()?.id;
         self.store.message_details.get(&message_id)
+    }
+
+    fn selected_folder(&self) -> Option<&Folder> {
+        self.store.folders.get(self.folder_index)
+    }
+
+    fn visible_messages(&self) -> Vec<&MessageSummary> {
+        let folder_id = self.selected_folder().map(|f| f.id);
+        self.store
+            .messages
+            .iter()
+            .filter(|msg| Some(msg.folder_id) == folder_id)
+            .collect()
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
@@ -489,34 +515,69 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) => return true,
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
-                if self.message_index + 1 < self.store.messages.len() {
-                    self.message_index += 1;
-                    if self.view_mode == ViewMode::Rendered {
-                        self.schedule_render();
+                match self.focus {
+                    Focus::Messages => {
+                        let count = self.visible_messages().len();
+                        if self.message_index + 1 < count {
+                            self.message_index += 1;
+                            if self.view_mode == ViewMode::Rendered {
+                                self.schedule_render();
+                            }
+                        }
+                    }
+                    Focus::Folders => {
+                        if self.folder_index + 1 < self.store.folders.len() {
+                            self.folder_index += 1;
+                            self.message_index = 0;
+                            if self.view_mode == ViewMode::Rendered {
+                                self.schedule_render();
+                            }
+                        }
                     }
                 }
             }
             (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
-                if self.message_index > 0 {
-                    self.message_index -= 1;
-                    if self.view_mode == ViewMode::Rendered {
-                        self.schedule_render();
+                match self.focus {
+                    Focus::Messages => {
+                        if self.message_index > 0 {
+                            self.message_index -= 1;
+                            if self.view_mode == ViewMode::Rendered {
+                                self.schedule_render();
+                            }
+                        }
+                    }
+                    Focus::Folders => {
+                        if self.folder_index > 0 {
+                            self.folder_index -= 1;
+                            self.message_index = 0;
+                            if self.view_mode == ViewMode::Rendered {
+                                self.schedule_render();
+                            }
+                        }
                     }
                 }
             }
             (KeyCode::Enter, _) => {
-                self.mode = Mode::ViewFocus;
-                self.view_scroll = 0;
-                let _ = self.engine.send(MailCommand::SyncFolder(1));
-                self.ensure_text_cache_for_selected();
-                if self.view_mode == ViewMode::Rendered {
-                    self.schedule_render();
+                if self.focus == Focus::Messages {
+                    self.mode = Mode::ViewFocus;
+                    self.view_scroll = 0;
+                    let _ = self.engine.send(MailCommand::SyncFolder(1));
+                    self.ensure_text_cache_for_selected();
+                    if self.view_mode == ViewMode::Rendered {
+                        self.schedule_render();
+                    }
                 }
             }
             (KeyCode::Esc, _) => {
                 if self.mode == Mode::ViewFocus {
                     self.mode = Mode::View;
                 }
+            }
+            (KeyCode::Tab, _) | (KeyCode::Char('h'), _) | (KeyCode::Left, _) => {
+                self.focus = Focus::Folders;
+            }
+            (KeyCode::Right, _) => {
+                self.focus = Focus::Messages;
             }
             (KeyCode::Char('v'), _) => {
                 self.view_mode = match self.view_mode {
@@ -531,6 +592,7 @@ impl App {
             }
             (KeyCode::Char('l'), _) => {
                 self.ensure_text_cache_for_selected();
+                self.link_index = 0;
                 self.overlay_return = self.mode;
                 self.mode = Mode::OverlayLinks;
             }
@@ -620,11 +682,39 @@ impl App {
     }
 
     fn on_key_overlay(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = self.overlay_return;
-            }
-            KeyCode::Char('q') => return true,
+        match self.mode {
+            Mode::OverlayLinks => match key.code {
+                KeyCode::Esc => {
+                    self.mode = self.overlay_return;
+                }
+                KeyCode::Char('q') => return true,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let count = self.selected_detail().map(|d| d.links.len()).unwrap_or(0);
+                    if self.link_index + 1 < count {
+                        self.link_index += 1;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if self.link_index > 0 {
+                        self.link_index -= 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(detail) = self.selected_detail() {
+                        if let Some(link) = detail.links.get(self.link_index) {
+                            let _ = open::that(link);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Mode::OverlayAttach => match key.code {
+                KeyCode::Esc => {
+                    self.mode = self.overlay_return;
+                }
+                KeyCode::Char('q') => return true,
+                _ => {}
+            },
             _ => {}
         }
         false
@@ -953,13 +1043,23 @@ fn render_folders(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .store
         .folders
         .iter()
-        .map(|folder| {
+        .enumerate()
+        .map(|(idx, folder)| {
             let label = if folder.unread > 0 {
                 format!("{}  {}", folder.name, folder.unread)
             } else {
                 folder.name.clone()
             };
-            Line::from(Span::raw(label))
+            let style = if idx == app.folder_index {
+                if app.focus == Focus::Folders {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                }
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(label, style))
         })
         .collect();
 
@@ -975,15 +1075,18 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows: Vec<Row> = app
-        .store
-        .messages
+    let visible = app.visible_messages();
+    let rows: Vec<Row> = visible
         .iter()
         .enumerate()
         .map(|(idx, message)| {
             let unread = if message.unread { "*" } else { " " };
             let style = if idx == app.message_index {
-                Style::default().bg(Color::DarkGray)
+                if app.focus == Focus::Messages {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                }
             } else {
                 Style::default()
             };
@@ -1014,6 +1117,8 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     if let Some(message) = app.selected_message() {
         let preview = format!("Preview: {}", message.preview);
         frame.render_widget(Paragraph::new(preview), preview_area);
+    } else {
+        frame.render_widget(Paragraph::new("No messages"), preview_area);
     }
 }
 
@@ -1056,12 +1161,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                         Line::from("Terminal image support not detected."),
                     ])
                 } else if render_pending {
-                    Text::from(vec![
-                        Line::from(""),
-                        Line::from("Rendering..."),
-                        Line::from(""),
-                        Line::from("Links: [l]  Attach: [a]"),
-                    ])
+                    Text::from("")
                 } else if let Some(err) = render_error {
                     Text::from(vec![
                         Line::from(""),
@@ -1071,12 +1171,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                         Line::from("Or RATMAIL_CHROME_NO_SANDBOX=1"),
                     ])
                 } else if render_no_html {
-                    Text::from(vec![
-                        Line::from(""),
-                        Line::from("No HTML part found for this message."),
-                        Line::from("Rendered mode requires HTML content."),
-                        Line::from("Switch to Text mode (v)."),
-                    ])
+                    Text::from(detail.body.as_str())
                 } else if render_tile_count == 0 && renderer_is_chromium {
                     Text::from(vec![
                         Line::from(""),
@@ -1149,7 +1244,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
 }
 
 fn render_help_bar(frame: &mut ratatui::Frame, area: Rect) {
-    let help = "j/k move  Enter open  v toggle view  r reply  R reply-all  f forward  m move  d delete  q quit";
+    let help = "Tab/h/l focus  j/k move  Enter open  v toggle view  r reply  R reply-all  f forward  m move  d delete  q quit";
     let block = Block::default().borders(Borders::TOP);
     frame.render_widget(Paragraph::new(help).block(block), area);
 }
@@ -1190,7 +1285,15 @@ fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             lines.push(Line::from("  (no links found)"));
         } else {
             for (idx, link) in detail.links.iter().enumerate() {
-                lines.push(Line::from(format!("  {:>2}  {}", idx + 1, link)));
+                let style = if idx == app.link_index {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("  {:>2}  {}", idx + 1, link),
+                    style,
+                )));
             }
         }
     } else {

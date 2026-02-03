@@ -19,6 +19,7 @@ serde = { version = "1.0", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ratatui-image = { version = "10.0.4", default-features = false, features = ["crossterm", "image-defaults"] }
 headless_chrome = "1.0.17"
+open = "5.3"
 tokio = { version = "1.43", features = ["full"] }
 ratatui = "0.30"
 crossterm = "0.28"
