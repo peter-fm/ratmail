@@ -7,3 +7,13 @@ port = 587
 username = "user@example.com"
 password = "app-password-or-smtp-password"
 from = "Your Name <user@example.com>"
+
+[imap]
+host = "imap.example.com"
+port = 993
+username = "user@example.com"
+password = "app-password-or-imap-password"
+
+[render]
+remote_images = false
+width_px = 1000

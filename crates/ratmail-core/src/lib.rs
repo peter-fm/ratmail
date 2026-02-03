@@ -24,6 +24,7 @@ pub struct Folder {
 pub struct MessageSummary {
     pub id: i64,
     pub folder_id: i64,
+    pub imap_uid: Option<u32>,
     pub date: String,
     pub from: String,
     pub subject: String,
@@ -70,6 +71,7 @@ pub const DEFAULT_TEXT_WIDTH: i64 = 80;
 pub trait MailStore: Send + Sync {
     async fn load_snapshot(&self, account_id: i64, folder_id: i64) -> Result<StoreSnapshot>;
     async fn get_raw_body(&self, message_id: i64) -> Result<Option<Vec<u8>>>;
+    async fn upsert_raw_body(&self, message_id: i64, raw: &[u8]) -> Result<()>;
     async fn upsert_cache_text(&self, message_id: i64, width_cols: i64, text: &str) -> Result<()>;
     async fn get_cache_html(&self, message_id: i64, remote_policy: &str) -> Result<Option<String>>;
     async fn upsert_cache_html(&self, message_id: i64, remote_policy: &str, html: &str)
@@ -78,6 +80,7 @@ pub trait MailStore: Send + Sync {
         &self,
         message_id: i64,
         width_px: i64,
+        tile_height_px: i64,
         theme: &str,
         remote_policy: &str,
     ) -> Result<Vec<TileMeta>>;
@@ -85,6 +88,7 @@ pub trait MailStore: Send + Sync {
         &self,
         message_id: i64,
         width_px: i64,
+        tile_height_px: i64,
         theme: &str,
         remote_policy: &str,
         tiles: &[TileMeta],
@@ -116,6 +120,184 @@ impl SqliteMailStore {
     pub async fn init(&self) -> Result<()> {
         sqlx::migrate!("../../migrations").run(&self.pool).await?;
         Ok(())
+    }
+
+    pub async fn upsert_account(&self, id: i64, name: &str, address: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO accounts (id, name, address) VALUES (?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, address = excluded.address",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(address)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_account_data(&self, account_id: i64) -> Result<()> {
+        let message_ids: Vec<i64> = sqlx::query_as::<_, (i64,)>(
+            "SELECT id FROM messages WHERE account_id = ?",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| row.0)
+        .collect();
+
+        if !message_ids.is_empty() {
+            let placeholders = message_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            for table in ["bodies", "cache_text", "cache_html", "cache_tiles"] {
+                let query = format!("DELETE FROM {} WHERE message_id IN ({})", table, placeholders);
+                let mut q = sqlx::query(&query);
+                for id in &message_ids {
+                    q = q.bind(id);
+                }
+                q.execute(&self.pool).await?;
+            }
+        }
+
+        sqlx::query("DELETE FROM messages WHERE account_id = ?")
+            .bind(account_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM folders WHERE account_id = ?")
+            .bind(account_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_folders(
+        &self,
+        account_id: i64,
+        folders: &[Folder],
+    ) -> Result<Vec<Folder>> {
+        let existing = sqlx::query_as::<_, (i64, String)>(
+            "SELECT id, name FROM folders WHERE account_id = ?",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut by_name: HashMap<String, i64> = HashMap::new();
+        for (id, name) in existing {
+            by_name.insert(name, id);
+        }
+
+        let mut kept_names: Vec<String> = Vec::new();
+        let mut output = Vec::new();
+        for folder in folders {
+            let id = if let Some(id) = by_name.get(&folder.name) {
+                sqlx::query("UPDATE folders SET unread = ? WHERE id = ?")
+                    .bind(folder.unread as i64)
+                    .bind(*id)
+                    .execute(&self.pool)
+                    .await?;
+                *id
+            } else {
+                let result = sqlx::query(
+                    "INSERT INTO folders (account_id, name, unread) VALUES (?, ?, ?)",
+                )
+                .bind(account_id)
+                .bind(&folder.name)
+                .bind(folder.unread as i64)
+                .execute(&self.pool)
+                .await?;
+                result.last_insert_rowid()
+            };
+            kept_names.push(folder.name.clone());
+            output.push(Folder {
+                id,
+                account_id,
+                name: folder.name.clone(),
+                unread: folder.unread,
+            });
+        }
+
+        if kept_names.is_empty() {
+            sqlx::query("DELETE FROM folders WHERE account_id = ?")
+                .bind(account_id)
+                .execute(&self.pool)
+                .await?;
+        } else {
+            let placeholders = kept_names.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let query = format!(
+                "DELETE FROM folders WHERE account_id = ? AND name NOT IN ({})",
+                placeholders
+            );
+            let mut q = sqlx::query(&query).bind(account_id);
+            for name in &kept_names {
+                q = q.bind(name);
+            }
+            q.execute(&self.pool).await?;
+        }
+
+        Ok(output)
+    }
+
+    pub async fn replace_folder_messages(
+        &self,
+        account_id: i64,
+        folder_id: i64,
+        messages: &[MessageSummary],
+    ) -> Result<()> {
+        let ids: Vec<i64> = sqlx::query_as::<_, (i64,)>(
+            "SELECT id FROM messages WHERE folder_id = ?",
+        )
+        .bind(folder_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| row.0)
+        .collect();
+
+        if !ids.is_empty() {
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            for table in ["bodies", "cache_text", "cache_html", "cache_tiles"] {
+                let query = format!("DELETE FROM {} WHERE message_id IN ({})", table, placeholders);
+                let mut q = sqlx::query(&query);
+                for id in &ids {
+                    q = q.bind(id);
+                }
+                q.execute(&self.pool).await?;
+            }
+        }
+
+        sqlx::query("DELETE FROM messages WHERE folder_id = ?")
+            .bind(folder_id)
+            .execute(&self.pool)
+            .await?;
+
+        for msg in messages {
+            sqlx::query(
+                "INSERT INTO messages (account_id, folder_id, imap_uid, date, from_addr, subject, unread, preview)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(account_id)
+            .bind(folder_id)
+            .bind(msg.imap_uid.map(|v| v as i64))
+            .bind(&msg.date)
+            .bind(&msg.from)
+            .bind(&msg.subject)
+            .bind(if msg.unread { 1 } else { 0 })
+            .bind(&msg.preview)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn folder_id_by_name(&self, account_id: i64, name: &str) -> Result<Option<i64>> {
+        let row = sqlx::query_as::<_, (i64,)>(
+            "SELECT id FROM folders WHERE account_id = ? AND name = ?",
+        )
+        .bind(account_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
     }
 
     pub async fn seed_demo_if_empty(&self) -> Result<()> {
@@ -178,14 +360,15 @@ impl SqliteMailStore {
 
         for (id, folder_id, date, from, subject, unread, preview) in messages {
             sqlx::query(
-                "INSERT INTO messages (id, account_id, folder_id, date, from_addr, subject, unread, preview)
-                 VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+                "INSERT INTO messages (id, account_id, folder_id, imap_uid, date, from_addr, subject, unread, preview)
+                 VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(id) DO UPDATE SET folder_id = excluded.folder_id, date = excluded.date,
                  from_addr = excluded.from_addr, subject = excluded.subject, unread = excluded.unread,
                  preview = excluded.preview",
             )
             .bind(id)
             .bind(folder_id)
+            .bind(None::<i64>)
             .bind(date)
             .bind(from)
             .bind(subject)
@@ -387,8 +570,8 @@ impl MailStore for SqliteMailStore {
         .fetch_all(&self.pool)
         .await?;
 
-        let messages = sqlx::query_as::<_, (i64, i64, String, String, String, i64, String)>(
-            "SELECT id, folder_id, date, from_addr, subject, unread, preview
+        let messages = sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, String, i64, String)>(
+            "SELECT id, folder_id, imap_uid, date, from_addr, subject, unread, preview
              FROM messages WHERE account_id = ? ORDER BY id",
         )
         .bind(account_id)
@@ -445,11 +628,12 @@ impl MailStore for SqliteMailStore {
                 .map(|row| MessageSummary {
                     id: row.0,
                     folder_id: row.1,
-                    date: row.2,
-                    from: row.3,
-                    subject: row.4,
-                    unread: row.5 != 0,
-                    preview: row.6,
+                    imap_uid: row.2.map(|v| v as u32),
+                    date: row.3,
+                    from: row.4,
+                    subject: row.5,
+                    unread: row.6 != 0,
+                    preview: row.7,
                 })
                 .collect(),
             message_details,
@@ -464,6 +648,18 @@ impl MailStore for SqliteMailStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.0))
+    }
+
+    async fn upsert_raw_body(&self, message_id: i64, raw: &[u8]) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO bodies (message_id, raw_bytes) VALUES (?, ?)
+             ON CONFLICT(message_id) DO UPDATE SET raw_bytes = excluded.raw_bytes",
+        )
+        .bind(message_id)
+        .bind(raw)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn upsert_cache_text(&self, message_id: i64, width_cols: i64, text: &str) -> Result<()> {
@@ -516,17 +712,19 @@ impl MailStore for SqliteMailStore {
         &self,
         message_id: i64,
         width_px: i64,
+        tile_height_px: i64,
         theme: &str,
         remote_policy: &str,
     ) -> Result<Vec<TileMeta>> {
         let rows = sqlx::query_as::<_, (i64, i64, Vec<u8>)>(
             "SELECT tile_index, tile_height_px, png_bytes
              FROM cache_tiles
-             WHERE message_id = ? AND width_px = ? AND theme = ? AND remote_policy = ?
+             WHERE message_id = ? AND width_px = ? AND tile_height_px = ? AND theme = ? AND remote_policy = ?
              ORDER BY tile_index",
         )
         .bind(message_id)
         .bind(width_px)
+        .bind(tile_height_px)
         .bind(theme)
         .bind(remote_policy)
         .fetch_all(&self.pool)
@@ -551,6 +749,7 @@ impl MailStore for SqliteMailStore {
         &self,
         message_id: i64,
         width_px: i64,
+        tile_height_px: i64,
         theme: &str,
         remote_policy: &str,
         tiles: &[TileMeta],
@@ -568,7 +767,7 @@ impl MailStore for SqliteMailStore {
             .bind(remote_policy)
             .bind(tile.tile_index)
             .bind(&tile.bytes)
-            .bind(tile.height_px)
+            .bind(tile_height_px)
             .execute(&self.pool)
             .await?;
         }

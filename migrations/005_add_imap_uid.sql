@@ -1,0 +1,1 @@
+ALTER TABLE messages ADD COLUMN imap_uid INTEGER;

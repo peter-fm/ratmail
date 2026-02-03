@@ -20,6 +20,7 @@ pub enum RemotePolicy {
 pub struct RenderRequest<'a> {
     pub message_id: i64,
     pub width_px: i64,
+    pub tile_height_px: i64,
     pub theme: &'a str,
     pub remote_policy: RemotePolicy,
     pub prepared_html: &'a str,
@@ -123,7 +124,10 @@ impl Renderer for ChromiumRenderer {
             let tab = browser.new_tab()?;
             let wrapped_html = format!(
                 "<!doctype html><html><head><meta charset=\"utf-8\">\
-<style>body{{margin:0; padding:0; width:{}px;}}</style></head><body>{}</body></html>",
+<style>html,body{{margin:0; padding:0; width:{}px; overflow:hidden;}}\
+*{{box-sizing:border-box;}}\
+img{{max-width:100%; height:auto;}}\
+</style></head><body>{}</body></html>",
                 width_px, html
             );
             let data_url = format!(
@@ -131,18 +135,30 @@ impl Renderer for ChromiumRenderer {
                 BASE64_STD.encode(wrapped_html.as_bytes())
             );
             tab.navigate_to(&data_url)?;
-            tab.wait_until_navigated()?;
+            // Data URLs sometimes don't emit the navigation event expected by wait_until_navigated.
+            // Waiting for the body element is sufficient for our static HTML rendering.
             tab.wait_for_element("body")?;
-
-            let png = tab.capture_screenshot(
-                headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
-                None,
-                None,
-                true,
-            )?;
+            let png = {
+                use headless_chrome::protocol::cdp::Page;
+                let data = tab
+                    .call_method(Page::CaptureScreenshot {
+                        format: Some(Page::CaptureScreenshotFormatOption::Png),
+                        quality: None,
+                        clip: None,
+                        from_surface: Some(true),
+                        capture_beyond_viewport: Some(true),
+                        optimize_for_speed: None,
+                    })?
+                    .data;
+                base64::prelude::BASE64_STANDARD.decode(data)?
+            };
 
             let img = image::load_from_memory(&png)?;
-            let tiles = slice_image_into_tiles(img, 900, request.message_id);
+            let tiles = slice_image_into_tiles(
+                img,
+                request.tile_height_px as u32,
+                request.message_id,
+            );
             if tiles.is_empty() {
                 return Err(anyhow::anyhow!(
                     "Chromium produced no tiles (try RATMAIL_CHROME_PATH=/usr/bin/chromium or RATMAIL_CHROME_NO_SANDBOX=1)"

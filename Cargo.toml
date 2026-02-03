@@ -16,6 +16,9 @@ html2text = "0.12"
 linkify = "0.10"
 mailparse = "0.15"
 serde = { version = "1.0", features = ["derive"] }
+imap = "3.0.0-alpha.15"
+imap-proto = "0.16"
+native-tls = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 ratatui-image = { version = "9.0.0", default-features = false, features = ["crossterm", "image-defaults"] }
 headless_chrome = "1.0.17"
