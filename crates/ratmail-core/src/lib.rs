@@ -38,6 +38,7 @@ pub struct MessageDetail {
     pub from: String,
     pub date: String,
     pub body: String,
+    pub links: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +297,7 @@ impl MailStore for SqliteMailStore {
                         from,
                         date,
                         body,
+                        links: Vec::new(),
                     },
                 );
             }

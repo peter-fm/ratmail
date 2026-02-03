@@ -28,6 +28,7 @@ const TICK_RATE: Duration = Duration::from_millis(200);
 enum Mode {
     List,
     View,
+    ViewFocus,
     Compose,
     OverlayLinks,
     OverlayAttach,
@@ -50,6 +51,8 @@ struct App {
     events: tokio::sync::mpsc::UnboundedReceiver<MailEvent>,
     store_handle: SqliteMailStore,
     runtime: tokio::runtime::Runtime,
+    overlay_return: Mode,
+    view_scroll: u16,
 }
 
 impl App {
@@ -71,6 +74,8 @@ impl App {
             events,
             store_handle,
             runtime,
+            overlay_return: Mode::View,
+            view_scroll: 0,
         }
     }
 
@@ -85,7 +90,7 @@ impl App {
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
         match self.mode {
-            Mode::List | Mode::View => self.on_key_main(key),
+            Mode::List | Mode::View | Mode::ViewFocus => self.on_key_main(key),
             Mode::Compose => self.on_key_compose(key),
             Mode::OverlayLinks | Mode::OverlayAttach => self.on_key_overlay(key),
         }
@@ -94,7 +99,7 @@ impl App {
     fn ensure_text_cache_for_selected(&mut self) {
         let Some(message) = self.selected_message() else { return };
         if let Some(detail) = self.store.message_details.get(&message.id) {
-            if !detail.body.is_empty() {
+            if !detail.body.is_empty() && !detail.links.is_empty() {
                 return;
             }
         }
@@ -107,15 +112,16 @@ impl App {
                 store_handle
                     .upsert_cache_text(message_id, DEFAULT_TEXT_WIDTH, &display.text)
                     .await?;
-                Ok::<_, anyhow::Error>(Some(display.text))
+                Ok::<_, anyhow::Error>(Some(display))
             } else {
                 Ok::<_, anyhow::Error>(None)
             }
         });
 
-        if let Ok(Some(text)) = result {
+        if let Ok(Some(display)) = result {
             if let Some(detail) = self.store.message_details.get_mut(&message_id) {
-                detail.body = text;
+                detail.body = display.text;
+                detail.links = display.links;
             } else if let Some(summary) = self.selected_message() {
                 self.store.message_details.insert(
                     message_id,
@@ -124,7 +130,8 @@ impl App {
                         subject: summary.subject.clone(),
                         from: summary.from.clone(),
                         date: summary.date.clone(),
-                        body: text,
+                        body: display.text,
+                        links: display.links,
                     },
                 );
             }
@@ -141,6 +148,9 @@ impl App {
     }
 
     fn on_key_main(&mut self, key: KeyEvent) -> bool {
+        if self.mode == Mode::ViewFocus {
+            return self.on_key_focus(key);
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) => return true,
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
@@ -154,9 +164,15 @@ impl App {
                 }
             }
             (KeyCode::Enter, _) => {
-                self.mode = Mode::View;
+                self.mode = Mode::ViewFocus;
+                self.view_scroll = 0;
                 let _ = self.engine.send(MailCommand::SyncFolder(1));
                 self.ensure_text_cache_for_selected();
+            }
+            (KeyCode::Esc, _) => {
+                if self.mode == Mode::ViewFocus {
+                    self.mode = Mode::View;
+                }
             }
             (KeyCode::Char('v'), _) => {
                 self.view_mode = match self.view_mode {
@@ -168,14 +184,13 @@ impl App {
                 }
             }
             (KeyCode::Char('l'), _) => {
-                if self.mode == Mode::View {
-                    self.mode = Mode::OverlayLinks;
-                }
+                self.ensure_text_cache_for_selected();
+                self.overlay_return = self.mode;
+                self.mode = Mode::OverlayLinks;
             }
             (KeyCode::Char('a'), _) => {
-                if self.mode == Mode::View {
-                    self.mode = Mode::OverlayAttach;
-                }
+                self.overlay_return = self.mode;
+                self.mode = Mode::OverlayAttach;
             }
             (KeyCode::Char('r'), _) => {
                 self.mode = Mode::Compose;
@@ -191,10 +206,66 @@ impl App {
         false
     }
 
+    fn on_key_focus(&mut self, key: KeyEvent) -> bool {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) => return true,
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
+                self.view_scroll = self.view_scroll.saturating_add(1);
+            }
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+                self.view_scroll = self.view_scroll.saturating_sub(1);
+            }
+            (KeyCode::PageDown, _) => {
+                self.view_scroll = self.view_scroll.saturating_add(10);
+            }
+            (KeyCode::PageUp, _) => {
+                self.view_scroll = self.view_scroll.saturating_sub(10);
+            }
+            (KeyCode::Char('g'), _) => {
+                self.view_scroll = 0;
+            }
+            (KeyCode::Char('G'), _) => {
+                self.view_scroll = u16::MAX;
+            }
+            (KeyCode::Char('v'), _) => {
+                self.view_mode = match self.view_mode {
+                    ViewMode::Text => ViewMode::Rendered,
+                    ViewMode::Rendered => ViewMode::Text,
+                };
+                if self.view_mode == ViewMode::Text {
+                    self.ensure_text_cache_for_selected();
+                }
+            }
+            (KeyCode::Char('l'), _) => {
+                self.ensure_text_cache_for_selected();
+                self.overlay_return = self.mode;
+                self.mode = Mode::OverlayLinks;
+            }
+            (KeyCode::Char('a'), _) => {
+                self.overlay_return = self.mode;
+                self.mode = Mode::OverlayAttach;
+            }
+            (KeyCode::Char('r'), _) => {
+                self.mode = Mode::Compose;
+            }
+            (KeyCode::Char('R'), _) => {
+                self.mode = Mode::Compose;
+            }
+            (KeyCode::Char('f'), _) => {
+                self.mode = Mode::Compose;
+            }
+            (KeyCode::Esc, _) => {
+                self.mode = Mode::View;
+            }
+            _ => {}
+        }
+        false
+    }
+
     fn on_key_overlay(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => {
-                self.mode = Mode::View;
+                self.mode = self.overlay_return;
             }
             KeyCode::Char('q') => return true,
             _ => {}
@@ -284,6 +355,7 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
         Mode::OverlayLinks => render_links_overlay(frame, area, app),
         Mode::OverlayAttach => render_attach_overlay(frame, area, app),
         Mode::Compose => render_compose_overlay(frame, area, app),
+        Mode::ViewFocus => render_view_focus(frame, area, app),
         _ => {}
     }
 }
@@ -324,7 +396,7 @@ fn render_main(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 
     render_folders(frame, columns[0], app);
     render_message_list(frame, columns[1], app);
-    render_message_view(frame, columns[2], app);
+    render_message_view(frame, columns[2], app, 0);
 }
 
 fn render_folders(frame: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -396,7 +468,7 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     }
 }
 
-fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &App, scroll: u16) {
     let title = match app.view_mode {
         ViewMode::Text => "MESSAGE VIEW (text)",
         ViewMode::Rendered => "MESSAGE VIEW (rendered tiles)",
@@ -425,7 +497,8 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 
         let content_block = Paragraph::new(content_text)
             .block(Block::default().borders(Borders::ALL).title(title))
-            .wrap(Wrap { trim: false });
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -465,20 +538,32 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App) {
+fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let popup = centered_rect(80, 60, area);
     frame.render_widget(Clear, popup);
 
-    let lines = vec![
-        Line::from("Message: Re: Proposal"),
-        Line::from(""),
-        Line::from("  1  https://docs.example.com/proposal-v3"),
-        Line::from("  2  https://calendar.example.com/meet/7fd2"),
-        Line::from("  3  https://github.com/org/repo/pull/193"),
-        Line::from("  4  mailto:alex@example.com"),
-        Line::from(""),
-        Line::from("Enter open  y copy  o open ext  Esc close"),
-    ];
+    let mut lines = Vec::new();
+    let title = app
+        .selected_detail()
+        .map(|detail| format!("Message: {}", detail.subject))
+        .unwrap_or_else(|| "Message: (none)".to_string());
+    lines.push(Line::from(title));
+    lines.push(Line::from(""));
+
+    if let Some(detail) = app.selected_detail() {
+        if detail.links.is_empty() {
+            lines.push(Line::from("  (no links found)"));
+        } else {
+            for (idx, link) in detail.links.iter().enumerate() {
+                lines.push(Line::from(format!("  {:>2}  {}", idx + 1, link)));
+            }
+        }
+    } else {
+        lines.push(Line::from("  (no message selected)"));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Enter open  y copy  o open ext  Esc close"));
 
     let block = Block::default().borders(Borders::ALL).title("LINKS");
     let paragraph = Paragraph::new(Text::from(lines)).block(block).wrap(Wrap { trim: false });
@@ -537,4 +622,10 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App) {
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, popup);
+}
+
+fn render_view_focus(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let popup = centered_rect(90, 85, area);
+    frame.render_widget(Clear, popup);
+    render_message_view(frame, popup, app, app.view_scroll);
 }
