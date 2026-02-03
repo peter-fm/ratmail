@@ -16,7 +16,10 @@ use ratatui::{
     Terminal,
 };
 
-use ratmail_core::{MailStore, MessageDetail, MessageSummary, SqliteMailStore, StoreSnapshot};
+use ratmail_core::{
+    MailStore, MessageDetail, MessageSummary, SqliteMailStore, StoreSnapshot, DEFAULT_TEXT_WIDTH,
+};
+use ratmail_content::extract_display;
 use ratmail_mail::{MailCommand, MailEngine, MailEvent};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
@@ -45,13 +48,17 @@ struct App {
     sync_status: String,
     engine: MailEngine,
     events: tokio::sync::mpsc::UnboundedReceiver<MailEvent>,
+    store_handle: SqliteMailStore,
+    runtime: tokio::runtime::Runtime,
 }
 
 impl App {
     fn new(
         store: StoreSnapshot,
+        store_handle: SqliteMailStore,
         engine: MailEngine,
         events: tokio::sync::mpsc::UnboundedReceiver<MailEvent>,
+        runtime: tokio::runtime::Runtime,
     ) -> Self {
         Self {
             mode: Mode::List,
@@ -62,6 +69,8 @@ impl App {
             sync_status: "idle".to_string(),
             engine,
             events,
+            store_handle,
+            runtime,
         }
     }
 
@@ -79,6 +88,46 @@ impl App {
             Mode::List | Mode::View => self.on_key_main(key),
             Mode::Compose => self.on_key_compose(key),
             Mode::OverlayLinks | Mode::OverlayAttach => self.on_key_overlay(key),
+        }
+    }
+
+    fn ensure_text_cache_for_selected(&mut self) {
+        let Some(message) = self.selected_message() else { return };
+        if let Some(detail) = self.store.message_details.get(&message.id) {
+            if !detail.body.is_empty() {
+                return;
+            }
+        }
+
+        let message_id = message.id;
+        let store_handle = self.store_handle.clone();
+        let result = self.runtime.block_on(async move {
+            if let Some(raw) = store_handle.get_raw_body(message_id).await? {
+                let display = extract_display(&raw, DEFAULT_TEXT_WIDTH as usize)?;
+                store_handle
+                    .upsert_cache_text(message_id, DEFAULT_TEXT_WIDTH, &display.text)
+                    .await?;
+                Ok::<_, anyhow::Error>(Some(display.text))
+            } else {
+                Ok::<_, anyhow::Error>(None)
+            }
+        });
+
+        if let Ok(Some(text)) = result {
+            if let Some(detail) = self.store.message_details.get_mut(&message_id) {
+                detail.body = text;
+            } else if let Some(summary) = self.selected_message() {
+                self.store.message_details.insert(
+                    message_id,
+                    MessageDetail {
+                        id: message_id,
+                        subject: summary.subject.clone(),
+                        from: summary.from.clone(),
+                        date: summary.date.clone(),
+                        body: text,
+                    },
+                );
+            }
         }
     }
 
@@ -107,12 +156,16 @@ impl App {
             (KeyCode::Enter, _) => {
                 self.mode = Mode::View;
                 let _ = self.engine.send(MailCommand::SyncFolder(1));
+                self.ensure_text_cache_for_selected();
             }
             (KeyCode::Char('v'), _) => {
                 self.view_mode = match self.view_mode {
                     ViewMode::Text => ViewMode::Rendered,
                     ViewMode::Rendered => ViewMode::Text,
                 };
+                if self.view_mode == ViewMode::Text {
+                    self.ensure_text_cache_for_selected();
+                }
             }
             (KeyCode::Char('l'), _) => {
                 if self.mode == Mode::View {
@@ -165,15 +218,13 @@ impl App {
 
 fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    let (engine, events) = rt.block_on(async {
+    let (engine, events, store_handle, store) = rt.block_on(async {
         let (engine, events) = MailEngine::start();
-        (engine, events)
-    });
-    let store = rt.block_on(async {
-        let store = SqliteMailStore::connect("ratmail.db").await?;
-        store.init().await?;
-        store.seed_demo_if_empty().await?;
-        store.load_snapshot(1, 1).await
+        let store_handle = SqliteMailStore::connect("ratmail.db").await?;
+        store_handle.init().await?;
+        store_handle.seed_demo_if_empty().await?;
+        let snapshot = store_handle.load_snapshot(1, 1).await?;
+        Ok::<_, anyhow::Error>((engine, events, store_handle, snapshot))
     })?;
 
     enable_raw_mode()?;
@@ -182,7 +233,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, App::new(store, engine, events));
+    let res = run_app(&mut terminal, App::new(store, store_handle, engine, events, rt));
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;

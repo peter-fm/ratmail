@@ -11,6 +11,7 @@ ratatui.workspace = true
 tokio.workspace = true
 
 ratmail-core = { path = "../ratmail-core" }
+ratmail-content = { path = "../ratmail-content" }
 ratmail-mail = { path = "../ratmail-mail" }
 
 [[bin]]

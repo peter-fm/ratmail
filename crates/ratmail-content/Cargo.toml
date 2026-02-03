@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+ammonia.workspace = true
+html2text.workspace = true
+linkify.workspace = true
+mailparse.workspace = true
 serde.workspace = true
 
 ratmail-core = { path = "../ratmail-core" }
