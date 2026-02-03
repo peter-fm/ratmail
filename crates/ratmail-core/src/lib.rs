@@ -57,6 +57,13 @@ pub struct AttachmentMeta {
     pub size: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TileMeta {
+    pub tile_index: i64,
+    pub height_px: i64,
+    pub bytes: Vec<u8>,
+}
+
 pub const DEFAULT_TEXT_WIDTH: i64 = 80;
 
 #[async_trait]
@@ -67,6 +74,21 @@ pub trait MailStore: Send + Sync {
     async fn get_cache_html(&self, message_id: i64, remote_policy: &str) -> Result<Option<String>>;
     async fn upsert_cache_html(&self, message_id: i64, remote_policy: &str, html: &str)
         -> Result<()>;
+    async fn get_cache_tiles(
+        &self,
+        message_id: i64,
+        width_px: i64,
+        theme: &str,
+        remote_policy: &str,
+    ) -> Result<Vec<TileMeta>>;
+    async fn upsert_cache_tiles(
+        &self,
+        message_id: i64,
+        width_px: i64,
+        theme: &str,
+        remote_policy: &str,
+        tiles: &[TileMeta],
+    ) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -407,6 +429,64 @@ impl MailStore for SqliteMailStore {
         .bind(html)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn get_cache_tiles(
+        &self,
+        message_id: i64,
+        width_px: i64,
+        theme: &str,
+        remote_policy: &str,
+    ) -> Result<Vec<TileMeta>> {
+        let rows = sqlx::query_as::<_, (i64, i64, Vec<u8>)>(
+            "SELECT tile_index, tile_height_px, png_bytes
+             FROM cache_tiles
+             WHERE message_id = ? AND width_px = ? AND theme = ? AND remote_policy = ?
+             ORDER BY tile_index",
+        )
+        .bind(message_id)
+        .bind(width_px)
+        .bind(theme)
+        .bind(remote_policy)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| TileMeta {
+                tile_index: row.0,
+                height_px: row.1,
+                bytes: row.2,
+            })
+            .collect())
+    }
+
+    async fn upsert_cache_tiles(
+        &self,
+        message_id: i64,
+        width_px: i64,
+        theme: &str,
+        remote_policy: &str,
+        tiles: &[TileMeta],
+    ) -> Result<()> {
+        for tile in tiles {
+            sqlx::query(
+                "INSERT INTO cache_tiles (message_id, width_px, theme, remote_policy, tile_index, png_bytes, tile_height_px, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                 ON CONFLICT(message_id, width_px, theme, remote_policy, tile_index)
+                 DO UPDATE SET png_bytes = excluded.png_bytes, tile_height_px = excluded.tile_height_px, updated_at = excluded.updated_at",
+            )
+            .bind(message_id)
+            .bind(width_px)
+            .bind(theme)
+            .bind(remote_policy)
+            .bind(tile.tile_index)
+            .bind(&tile.bytes)
+            .bind(tile.height_px)
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 }

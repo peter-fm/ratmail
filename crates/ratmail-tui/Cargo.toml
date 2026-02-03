@@ -13,6 +13,7 @@ tokio.workspace = true
 ratmail-core = { path = "../ratmail-core" }
 ratmail-content = { path = "../ratmail-content" }
 ratmail-mail = { path = "../ratmail-mail" }
+ratmail-render = { path = "../ratmail-render" }
 
 [[bin]]
 name = "ratmail"

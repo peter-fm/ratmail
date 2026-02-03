@@ -16,6 +16,7 @@ html2text = "0.12"
 linkify = "0.10"
 mailparse = "0.15"
 serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1.8", features = ["v4"] }
 tokio = { version = "1.43", features = ["full"] }
 ratatui = "0.29"
 crossterm = "0.28"

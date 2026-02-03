@@ -21,6 +21,7 @@ use ratmail_core::{
 };
 use ratmail_content::{extract_attachments, extract_display, prepare_html};
 use ratmail_mail::{MailCommand, MailEngine, MailEvent};
+use ratmail_render::{NullRenderer, RemotePolicy, Renderer};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
 
@@ -53,6 +54,9 @@ struct App {
     runtime: tokio::runtime::Runtime,
     overlay_return: Mode,
     view_scroll: u16,
+    render_supported: bool,
+    render_pending: bool,
+    renderer: NullRenderer,
 }
 
 impl App {
@@ -62,6 +66,7 @@ impl App {
         engine: MailEngine,
         events: tokio::sync::mpsc::UnboundedReceiver<MailEvent>,
         runtime: tokio::runtime::Runtime,
+        render_supported: bool,
     ) -> Self {
         Self {
             mode: Mode::List,
@@ -76,6 +81,9 @@ impl App {
             runtime,
             overlay_return: Mode::View,
             view_scroll: 0,
+            render_supported,
+            render_pending: false,
+            renderer: NullRenderer::default(),
         }
     }
 
@@ -204,6 +212,55 @@ impl App {
         let _ = result;
     }
 
+    fn ensure_tiles_for_selected(&mut self) {
+        if !self.render_supported {
+            return;
+        }
+        let Some(message) = self.selected_message() else { return };
+        let message_id = message.id;
+        let store_handle = self.store_handle.clone();
+        let renderer = self.renderer.clone();
+        let width_px = 800i64;
+        let theme = "default";
+        let remote_policy = "blocked";
+
+        self.render_pending = true;
+        let result = self.runtime.block_on(async move {
+            let cached = store_handle
+                .get_cache_tiles(message_id, width_px, theme, remote_policy)
+                .await?;
+            if !cached.is_empty() {
+                return Ok::<_, anyhow::Error>(());
+            }
+
+            let html = store_handle
+                .get_cache_html(message_id, remote_policy)
+                .await?;
+            let Some(html) = html else { return Ok::<_, anyhow::Error>(()) };
+
+            let render_result = renderer
+                .render(ratmail_render::RenderRequest {
+                    message_id,
+                    width_px,
+                    theme,
+                    remote_policy: RemotePolicy::Blocked,
+                    prepared_html: &html,
+                })
+                .await?;
+
+            if !render_result.tiles.is_empty() {
+                store_handle
+                    .upsert_cache_tiles(message_id, width_px, theme, remote_policy, &render_result.tiles)
+                    .await?;
+            }
+
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let _ = result;
+        self.render_pending = false;
+    }
+
     fn on_event(&mut self, event: MailEvent) {
         match event {
             MailEvent::SyncStarted(_) => self.sync_status = "syncing".to_string(),
@@ -249,6 +306,7 @@ impl App {
                     self.ensure_text_cache_for_selected();
                 } else {
                     self.ensure_prepared_html_for_selected();
+                    self.ensure_tiles_for_selected();
                 }
             }
             (KeyCode::Char('l'), _) => {
@@ -369,6 +427,10 @@ fn main() -> Result<()> {
         let snapshot = store_handle.load_snapshot(1, 1).await?;
         Ok::<_, anyhow::Error>((engine, events, store_handle, snapshot))
     })?;
+    let render_supported = rt.block_on(async {
+        let renderer = NullRenderer::default();
+        renderer.supports_images().await
+    });
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -376,7 +438,10 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, App::new(store, store_handle, engine, events, rt));
+    let res = run_app(
+        &mut terminal,
+        App::new(store, store_handle, engine, events, rt, render_supported),
+    );
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -557,13 +622,30 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &App, scroll
         ]);
 
         let content_text = match app.view_mode {
-            ViewMode::Rendered => Text::from(vec![
-                Line::from(""),
-                Line::from("(HTML email rendered as image tiles via kitty/sixel)"),
-                Line::from(""),
-                Line::from("Scroll: 38% (PgDn/PgUp)"),
-                Line::from("Links: [l]  Attach: [a]"),
-            ]),
+            ViewMode::Rendered => {
+                if !app.render_supported {
+                    Text::from(vec![
+                        Line::from(""),
+                        Line::from("Rendered mode disabled."),
+                        Line::from("Terminal image support not detected."),
+                    ])
+                } else if app.render_pending {
+                    Text::from(vec![
+                        Line::from(""),
+                        Line::from("Rendering..."),
+                        Line::from(""),
+                        Line::from("Links: [l]  Attach: [a]"),
+                    ])
+                } else {
+                    Text::from(vec![
+                        Line::from(""),
+                        Line::from("(HTML email rendered as image tiles via kitty/sixel)"),
+                        Line::from(""),
+                        Line::from("Scroll:  0%  (PgDn/PgUp)"),
+                        Line::from("Links: [l]  Attach: [a]"),
+                    ])
+                }
+            }
             ViewMode::Text => Text::from(detail.body.as_str()),
         };
 

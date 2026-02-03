@@ -1334,6 +1334,7 @@ dependencies = [
  "ratmail-content",
  "ratmail-core",
  "ratmail-mail",
+ "ratmail-render",
  "tokio",
 ]
 
@@ -1377,8 +1378,10 @@ name = "ratmail-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "ratmail-core",
  "serde",
+ "tokio",
 ]
 
 [[package]]

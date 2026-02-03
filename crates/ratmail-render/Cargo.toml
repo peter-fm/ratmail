@@ -7,5 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
 
 ratmail-core = { path = "../ratmail-core" }
