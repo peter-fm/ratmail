@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
@@ -17,13 +18,39 @@ use ratatui::{
 };
 
 use ratmail_core::{
-    MailStore, MessageDetail, MessageSummary, SqliteMailStore, StoreSnapshot, DEFAULT_TEXT_WIDTH,
+    MailStore, MessageDetail, MessageSummary, SqliteMailStore, StoreSnapshot, TileMeta,
+    DEFAULT_TEXT_WIDTH,
 };
 use ratmail_content::{extract_attachments, extract_display, prepare_html};
 use ratmail_mail::{MailCommand, MailEngine, MailEvent};
-use ratmail_render::{NullRenderer, RemotePolicy, Renderer};
+use ratmail_render::{detect_image_support, ChromiumRenderer, NullRenderer, RemotePolicy, Renderer};
+use std::sync::Arc;
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
+const RENDER_DEBOUNCE: Duration = Duration::from_millis(200);
+const RENDER_PREFETCH_NEXT: usize = 2;
+const RENDER_PREFETCH_PREV: usize = 1;
+const TILE_CACHE_BUDGET_BYTES: i64 = 256 * 1024 * 1024;
+const RENDER_MEM_CACHE_LIMIT: usize = 32;
+const PROTOCOL_CACHE_LIMIT: usize = 16;
+
+#[derive(Debug, Clone)]
+struct RenderRequest {
+    request_id: u64,
+    message_ids: Vec<i64>,
+    width_px: i64,
+    theme: String,
+    remote_policy: String,
+}
+
+#[derive(Debug, Clone)]
+struct RenderEvent {
+    message_id: i64,
+    tiles: Vec<TileMeta>,
+    no_html: bool,
+    error: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -55,8 +82,24 @@ struct App {
     overlay_return: Mode,
     view_scroll: u16,
     render_supported: bool,
+    render_tile_count: usize,
+    render_tiles: Vec<TileMeta>,
+    render_tile_index: usize,
+    image_picker: Option<Picker>,
+    image_protocol: Option<StatefulProtocol>,
+    renderer_is_chromium: bool,
+    render_error: Option<String>,
+    render_no_html: bool,
     render_pending: bool,
-    renderer: NullRenderer,
+    render_request_tx: tokio::sync::watch::Sender<RenderRequest>,
+    render_events: tokio::sync::mpsc::UnboundedReceiver<RenderEvent>,
+    pending_render: Option<Instant>,
+    render_request_id: u64,
+    render_cache: HashMap<i64, Vec<TileMeta>>,
+    render_cache_lru: VecDeque<i64>,
+    protocol_cache: HashMap<(i64, usize), StatefulProtocol>,
+    protocol_cache_lru: VecDeque<(i64, usize)>,
+    last_render_area: Option<(u16, u16)>,
 }
 
 impl App {
@@ -67,8 +110,12 @@ impl App {
         events: tokio::sync::mpsc::UnboundedReceiver<MailEvent>,
         runtime: tokio::runtime::Runtime,
         render_supported: bool,
+        image_picker: Option<Picker>,
+        renderer_is_chromium: bool,
+        render_request_tx: tokio::sync::watch::Sender<RenderRequest>,
+        render_events: tokio::sync::mpsc::UnboundedReceiver<RenderEvent>,
     ) -> Self {
-        Self {
+        let mut app = Self {
             mode: Mode::List,
             view_mode: ViewMode::Rendered,
             store,
@@ -82,9 +129,29 @@ impl App {
             overlay_return: Mode::View,
             view_scroll: 0,
             render_supported,
+            render_tile_count: 0,
+            render_tiles: Vec::new(),
+            render_tile_index: 0,
+            image_picker,
+            image_protocol: None,
+            renderer_is_chromium,
+            render_error: None,
+            render_no_html: false,
             render_pending: false,
-            renderer: NullRenderer::default(),
+            render_request_tx,
+            render_events,
+            pending_render: None,
+            render_request_id: 0,
+            render_cache: HashMap::new(),
+            render_cache_lru: VecDeque::new(),
+            protocol_cache: HashMap::new(),
+            protocol_cache_lru: VecDeque::new(),
+            last_render_area: None,
+        };
+        if app.view_mode == ViewMode::Rendered {
+            app.schedule_render();
         }
+        app
     }
 
     fn selected_message(&self) -> Option<&MessageSummary> {
@@ -102,6 +169,201 @@ impl App {
             Mode::Compose => self.on_key_compose(key),
             Mode::OverlayLinks | Mode::OverlayAttach => self.on_key_overlay(key),
         }
+    }
+
+    fn on_tick(&mut self) {
+        if let Some(started) = self.pending_render {
+            if started.elapsed() >= RENDER_DEBOUNCE {
+                self.pending_render = None;
+                self.enqueue_render_plan();
+            }
+        }
+    }
+
+    fn schedule_render(&mut self) {
+        if !self.render_supported {
+            return;
+        }
+        self.render_error = None;
+        self.render_no_html = false;
+
+        if self.try_load_cached_tiles_memory() {
+            self.render_pending = false;
+            self.pending_render = None;
+            return;
+        }
+
+        if self.try_load_cached_tiles_db() {
+            self.render_pending = false;
+            self.pending_render = None;
+            return;
+        }
+
+        self.render_pending = true;
+        self.pending_render = Some(Instant::now());
+    }
+
+    fn enqueue_render_plan(&mut self) {
+        if self.view_mode != ViewMode::Rendered {
+            return;
+        }
+        let Some(message) = self.selected_message() else { return };
+        let mut ids = Vec::new();
+        ids.push(message.id);
+
+        for i in 1..=RENDER_PREFETCH_NEXT {
+            if let Some(m) = self.store.messages.get(self.message_index + i) {
+                ids.push(m.id);
+            }
+        }
+        for i in 1..=RENDER_PREFETCH_PREV {
+            if let Some(m) = self
+                .message_index
+                .checked_sub(i)
+                .and_then(|idx| self.store.messages.get(idx))
+            {
+                ids.push(m.id);
+            }
+        }
+
+        self.render_request_id += 1;
+        let _ = self.render_request_tx.send(RenderRequest {
+            request_id: self.render_request_id,
+            message_ids: ids,
+            width_px: 800,
+            theme: "default".to_string(),
+            remote_policy: "blocked".to_string(),
+        });
+    }
+
+    fn try_load_cached_tiles_memory(&mut self) -> bool {
+        let Some(message) = self.selected_message() else { return false };
+        let message_id = message.id;
+        let Some(tiles) = self.render_cache.get(&message_id) else { return false };
+        let tiles = tiles.clone();
+        self.apply_render_tiles(message_id, tiles);
+        self.touch_render_cache(message_id);
+        true
+    }
+
+    fn try_load_cached_tiles_db(&mut self) -> bool {
+        let Some(message) = self.selected_message() else { return false };
+        let store_handle = self.store_handle.clone();
+        let message_id = message.id;
+        let width_px = 800i64;
+        let theme = "default";
+        let remote_policy = "blocked";
+
+        let cached = self.runtime.block_on(async move {
+            store_handle
+                .get_cache_tiles(message_id, width_px, theme, remote_policy)
+                .await
+        });
+
+        let Ok(tiles) = cached else { return false };
+        if tiles.is_empty() {
+            return false;
+        }
+        self.insert_render_cache(message_id, tiles.clone());
+        self.apply_render_tiles(message_id, tiles);
+        true
+    }
+
+    fn apply_render_tiles(&mut self, message_id: i64, tiles: Vec<TileMeta>) {
+        self.render_tiles = tiles;
+        self.render_tile_count = self.render_tiles.len();
+        self.render_tile_index = 0;
+        self.render_error = None;
+        self.render_no_html = false;
+
+        self.image_protocol = self.take_cached_protocol(message_id, 0);
+
+        self.touch_render_cache(message_id);
+    }
+
+    fn insert_render_cache(&mut self, message_id: i64, tiles: Vec<TileMeta>) {
+        if !self.render_cache.contains_key(&message_id) {
+            self.render_cache_lru.push_front(message_id);
+        }
+        self.render_cache.insert(message_id, tiles);
+        self.prune_render_cache();
+    }
+
+    fn take_cached_protocol(&mut self, message_id: i64, tile_index: usize) -> Option<StatefulProtocol> {
+        let key = (message_id, tile_index);
+        if let Some(protocol) = self.protocol_cache.remove(&key) {
+            self.touch_protocol_cache(key);
+            return Some(protocol);
+        }
+        None
+    }
+
+    fn store_protocol_cache(&mut self, message_id: i64, tile_index: usize, protocol: StatefulProtocol) {
+        let key = (message_id, tile_index);
+        self.protocol_cache.insert(key, protocol);
+        self.touch_protocol_cache(key);
+        self.prune_protocol_cache();
+    }
+
+    fn touch_protocol_cache(&mut self, key: (i64, usize)) {
+        if let Some(pos) = self.protocol_cache_lru.iter().position(|k| *k == key) {
+            self.protocol_cache_lru.remove(pos);
+        }
+        self.protocol_cache_lru.push_front(key);
+    }
+
+    fn prune_protocol_cache(&mut self) {
+        while self.protocol_cache_lru.len() > PROTOCOL_CACHE_LIMIT {
+            if let Some(key) = self.protocol_cache_lru.pop_back() {
+                self.protocol_cache.remove(&key);
+            }
+        }
+    }
+
+    fn touch_render_cache(&mut self, message_id: i64) {
+        if let Some(pos) = self.render_cache_lru.iter().position(|id| *id == message_id) {
+            self.render_cache_lru.remove(pos);
+            self.render_cache_lru.push_front(message_id);
+        }
+    }
+
+    fn prune_render_cache(&mut self) {
+        while self.render_cache_lru.len() > RENDER_MEM_CACHE_LIMIT {
+            if let Some(id) = self.render_cache_lru.pop_back() {
+                self.render_cache.remove(&id);
+            }
+        }
+    }
+
+    fn on_render_event(&mut self, event: RenderEvent) {
+        let Some(selected) = self.selected_message() else { return };
+        if selected.id != event.message_id {
+            return;
+        }
+
+        if let Some(err) = event.error {
+            self.render_error = Some(err);
+            self.render_no_html = false;
+            self.render_tile_count = 0;
+            self.render_tiles.clear();
+            self.image_protocol = None;
+            self.render_pending = false;
+            return;
+        }
+
+        self.render_no_html = event.no_html;
+        if event.no_html {
+            self.render_tile_count = 0;
+            self.render_tiles.clear();
+            self.image_protocol = None;
+            self.render_pending = false;
+            return;
+        }
+
+        let tiles = event.tiles;
+        self.insert_render_cache(event.message_id, tiles.clone());
+        self.apply_render_tiles(event.message_id, tiles);
+        self.render_pending = false;
     }
 
     fn ensure_text_cache_for_selected(&mut self) {
@@ -186,80 +448,6 @@ impl App {
         }
     }
 
-    fn ensure_prepared_html_for_selected(&mut self) {
-        let Some(message) = self.selected_message() else { return };
-        let message_id = message.id;
-        let store_handle = self.store_handle.clone();
-        let result = self.runtime.block_on(async move {
-            if store_handle
-                .get_cache_html(message_id, "blocked")
-                .await?
-                .is_some()
-            {
-                return Ok::<_, anyhow::Error>(None::<()>);
-            }
-
-            if let Some(raw) = store_handle.get_raw_body(message_id).await? {
-                if let Some(prepared) = prepare_html(&raw, false)? {
-                    store_handle
-                        .upsert_cache_html(message_id, "blocked", &prepared.html)
-                        .await?;
-                }
-            }
-            Ok::<_, anyhow::Error>(None::<()>)
-        });
-
-        let _ = result;
-    }
-
-    fn ensure_tiles_for_selected(&mut self) {
-        if !self.render_supported {
-            return;
-        }
-        let Some(message) = self.selected_message() else { return };
-        let message_id = message.id;
-        let store_handle = self.store_handle.clone();
-        let renderer = self.renderer.clone();
-        let width_px = 800i64;
-        let theme = "default";
-        let remote_policy = "blocked";
-
-        self.render_pending = true;
-        let result = self.runtime.block_on(async move {
-            let cached = store_handle
-                .get_cache_tiles(message_id, width_px, theme, remote_policy)
-                .await?;
-            if !cached.is_empty() {
-                return Ok::<_, anyhow::Error>(());
-            }
-
-            let html = store_handle
-                .get_cache_html(message_id, remote_policy)
-                .await?;
-            let Some(html) = html else { return Ok::<_, anyhow::Error>(()) };
-
-            let render_result = renderer
-                .render(ratmail_render::RenderRequest {
-                    message_id,
-                    width_px,
-                    theme,
-                    remote_policy: RemotePolicy::Blocked,
-                    prepared_html: &html,
-                })
-                .await?;
-
-            if !render_result.tiles.is_empty() {
-                store_handle
-                    .upsert_cache_tiles(message_id, width_px, theme, remote_policy, &render_result.tiles)
-                    .await?;
-            }
-
-            Ok::<_, anyhow::Error>(())
-        });
-
-        let _ = result;
-        self.render_pending = false;
-    }
 
     fn on_event(&mut self, event: MailEvent) {
         match event {
@@ -279,11 +467,17 @@ impl App {
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
                 if self.message_index + 1 < self.store.messages.len() {
                     self.message_index += 1;
+                    if self.view_mode == ViewMode::Rendered {
+                        self.schedule_render();
+                    }
                 }
             }
             (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
                 if self.message_index > 0 {
                     self.message_index -= 1;
+                    if self.view_mode == ViewMode::Rendered {
+                        self.schedule_render();
+                    }
                 }
             }
             (KeyCode::Enter, _) => {
@@ -291,6 +485,9 @@ impl App {
                 self.view_scroll = 0;
                 let _ = self.engine.send(MailCommand::SyncFolder(1));
                 self.ensure_text_cache_for_selected();
+                if self.view_mode == ViewMode::Rendered {
+                    self.schedule_render();
+                }
             }
             (KeyCode::Esc, _) => {
                 if self.mode == Mode::ViewFocus {
@@ -305,8 +502,7 @@ impl App {
                 if self.view_mode == ViewMode::Text {
                     self.ensure_text_cache_for_selected();
                 } else {
-                    self.ensure_prepared_html_for_selected();
-                    self.ensure_tiles_for_selected();
+                    self.schedule_render();
                 }
             }
             (KeyCode::Char('l'), _) => {
@@ -362,7 +558,7 @@ impl App {
                 if self.view_mode == ViewMode::Text {
                     self.ensure_text_cache_for_selected();
                 } else {
-                    self.ensure_prepared_html_for_selected();
+                    self.schedule_render();
                 }
             }
             (KeyCode::Char('l'), _) => {
@@ -389,6 +585,13 @@ impl App {
             }
             _ => {}
         }
+
+        if self.view_mode == ViewMode::Rendered && self.render_tile_count > 0 {
+            let max = (self.render_tile_count - 1) as u16;
+            if self.view_scroll > max {
+                self.view_scroll = max;
+            }
+        }
         false
     }
 
@@ -403,7 +606,7 @@ impl App {
         false
     }
 
-    fn on_key_compose(&mut self, key: KeyEvent) -> bool {
+fn on_key_compose(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                 self.mode = Mode::View;
@@ -417,6 +620,150 @@ impl App {
     }
 }
 
+async fn render_worker(
+    mut rx: tokio::sync::watch::Receiver<RenderRequest>,
+    tx: tokio::sync::mpsc::UnboundedSender<RenderEvent>,
+    store: SqliteMailStore,
+    renderer: Arc<dyn Renderer>,
+) {
+    loop {
+        if rx.changed().await.is_err() {
+            break;
+        }
+        let request = rx.borrow().clone();
+        let current_id = request.request_id;
+        let allow_remote = request.remote_policy == "allowed";
+
+        for message_id in request.message_ids {
+            if rx.borrow().request_id != current_id {
+                break;
+            }
+
+            let html = match store
+                .get_cache_html(message_id, &request.remote_policy)
+                .await
+            {
+                Ok(Some(html)) => Some(html),
+                Ok(None) => {
+                    if let Ok(Some(raw)) = store.get_raw_body(message_id).await {
+                        if let Ok(Some(prepared)) = prepare_html(&raw, allow_remote) {
+                            let _ = store
+                                .upsert_cache_html(message_id, &request.remote_policy, &prepared.html)
+                                .await;
+                        }
+                    }
+                    store
+                        .get_cache_html(message_id, &request.remote_policy)
+                        .await
+                        .ok()
+                        .flatten()
+                }
+                Err(err) => {
+                    let _ = tx.send(RenderEvent {
+                        message_id,
+                        tiles: Vec::new(),
+                        no_html: false,
+                        error: Some(err.to_string()),
+                    });
+                    continue;
+                }
+            };
+
+            let Some(html) = html else {
+                let _ = tx.send(RenderEvent {
+                    message_id,
+                    tiles: Vec::new(),
+                    no_html: true,
+                    error: None,
+                });
+                continue;
+            };
+
+            match store
+                .get_cache_tiles(
+                    message_id,
+                    request.width_px,
+                    &request.theme,
+                    &request.remote_policy,
+                )
+                .await
+            {
+                Ok(cached) if !cached.is_empty() => {
+                    let _ = tx.send(RenderEvent {
+                        message_id,
+                        tiles: cached,
+                        no_html: false,
+                        error: None,
+                    });
+                    continue;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    let _ = tx.send(RenderEvent {
+                        message_id,
+                        tiles: Vec::new(),
+                        no_html: false,
+                        error: Some(err.to_string()),
+                    });
+                    continue;
+                }
+            }
+
+            let render_result = renderer
+                .render(ratmail_render::RenderRequest {
+                    message_id,
+                    width_px: request.width_px,
+                    theme: &request.theme,
+                    remote_policy: if allow_remote {
+                        RemotePolicy::Allowed
+                    } else {
+                        RemotePolicy::Blocked
+                    },
+                    prepared_html: &html,
+                })
+                .await;
+
+            match render_result {
+                Ok(result) => {
+                    if result.tiles.is_empty() {
+                        let _ = tx.send(RenderEvent {
+                            message_id,
+                            tiles: Vec::new(),
+                            no_html: false,
+                            error: Some("Chromium produced no tiles. Try RATMAIL_CHROME_PATH=/usr/bin/chromium or RATMAIL_CHROME_NO_SANDBOX=1".to_string()),
+                        });
+                        continue;
+                    }
+                    let _ = store
+                        .upsert_cache_tiles(
+                            message_id,
+                            request.width_px,
+                            &request.theme,
+                            &request.remote_policy,
+                            &result.tiles,
+                        )
+                        .await;
+                    let _ = store.prune_cache_tiles(TILE_CACHE_BUDGET_BYTES).await;
+                    let _ = tx.send(RenderEvent {
+                        message_id,
+                        tiles: result.tiles,
+                        no_html: false,
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(RenderEvent {
+                        message_id,
+                        tiles: Vec::new(),
+                        no_html: false,
+                        error: Some(err.to_string()),
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let (engine, events, store_handle, store) = rt.block_on(async {
@@ -427,10 +774,7 @@ fn main() -> Result<()> {
         let snapshot = store_handle.load_snapshot(1, 1).await?;
         Ok::<_, anyhow::Error>((engine, events, store_handle, snapshot))
     })?;
-    let render_supported = rt.block_on(async {
-        let renderer = NullRenderer::default();
-        renderer.supports_images().await
-    });
+    let render_supported = detect_image_support();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -438,9 +782,49 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    let picker = Picker::from_query_stdio().ok();
+    let (renderer, renderer_is_chromium): (Arc<dyn Renderer>, bool) =
+        match std::env::var("RATMAIL_RENDERER") {
+            Ok(value) if value.to_lowercase() == "null" => (Arc::new(NullRenderer::default()), false),
+            Ok(value) if value.to_lowercase() == "chromium" => {
+                (Arc::new(ChromiumRenderer::default()), true)
+            }
+            Ok(_) => (Arc::new(ChromiumRenderer::default()), true),
+            Err(_) => (Arc::new(ChromiumRenderer::default()), true),
+        };
+
+    let (render_request_tx, render_request_rx) = tokio::sync::watch::channel(RenderRequest {
+        request_id: 0,
+        message_ids: Vec::new(),
+        width_px: 800,
+        theme: "default".to_string(),
+        remote_policy: "blocked".to_string(),
+    });
+    let (render_event_tx, render_event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let store_for_worker = store_handle.clone();
+    let renderer_for_worker = renderer.clone();
+    let handle = rt.handle().clone();
+    handle.spawn(render_worker(
+        render_request_rx,
+        render_event_tx,
+        store_for_worker,
+        renderer_for_worker,
+    ));
+
     let res = run_app(
         &mut terminal,
-        App::new(store, store_handle, engine, events, rt, render_supported),
+        App::new(
+            store,
+            store_handle,
+            engine,
+            events,
+            rt,
+            render_supported,
+            picker,
+            renderer_is_chromium,
+            render_request_tx,
+            render_event_rx,
+        ),
     );
 
     disable_raw_mode()?;
@@ -452,10 +836,13 @@ fn main() -> Result<()> {
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> Result<()> {
     loop {
-        terminal.draw(|frame| ui(frame, &app))?;
+        terminal.draw(|frame| ui(frame, &mut app))?;
 
         while let Ok(event) = app.events.try_recv() {
             app.on_event(event);
+        }
+        while let Ok(event) = app.render_events.try_recv() {
+            app.on_render_event(event);
         }
 
         let timeout = TICK_RATE.saturating_sub(app.last_tick.elapsed());
@@ -469,11 +856,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> R
 
         if app.last_tick.elapsed() >= TICK_RATE {
             app.last_tick = Instant::now();
+            app.on_tick();
         }
     }
 }
 
-fn ui(frame: &mut ratatui::Frame, app: &App) {
+fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -521,7 +909,7 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
-fn render_main(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_main(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -605,13 +993,23 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     }
 }
 
-fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &App, scroll: u16) {
+fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, scroll: u16) {
     let title = match app.view_mode {
         ViewMode::Text => "MESSAGE VIEW (text)",
         ViewMode::Rendered => "MESSAGE VIEW (rendered tiles)",
     };
 
-    if let Some(detail) = app.selected_detail() {
+    let detail = app.selected_detail().cloned();
+    let view_mode = app.view_mode;
+    let render_supported = app.render_supported;
+    let render_pending = app.render_pending;
+    let render_tile_count = app.render_tile_count;
+    let renderer_is_chromium = app.renderer_is_chromium;
+    let render_error = app.render_error.clone();
+    let render_no_html = app.render_no_html;
+    let protocol_available = app.image_picker.is_some();
+
+    if let Some(detail) = detail {
         let meta_block = Text::from(vec![
             Line::from(Span::styled(
                 format!("Subject: {}", detail.subject),
@@ -621,27 +1019,49 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &App, scroll
             Line::from(format!("Date: {}", detail.date)),
         ]);
 
-        let content_text = match app.view_mode {
+        let content_text = match view_mode {
             ViewMode::Rendered => {
-                if !app.render_supported {
+                if !render_supported {
                     Text::from(vec![
                         Line::from(""),
                         Line::from("Rendered mode disabled."),
                         Line::from("Terminal image support not detected."),
                     ])
-                } else if app.render_pending {
+                } else if render_pending {
                     Text::from(vec![
                         Line::from(""),
                         Line::from("Rendering..."),
                         Line::from(""),
                         Line::from("Links: [l]  Attach: [a]"),
                     ])
+                } else if let Some(err) = render_error {
+                    Text::from(vec![
+                        Line::from(""),
+                        Line::from("Rendered mode failed."),
+                        Line::from(format!("Error: {}", err)),
+                        Line::from("Try setting RATMAIL_CHROME_PATH=/usr/bin/chromium"),
+                        Line::from("Or RATMAIL_CHROME_NO_SANDBOX=1"),
+                    ])
+                } else if render_no_html {
+                    Text::from(vec![
+                        Line::from(""),
+                        Line::from("No HTML part found for this message."),
+                        Line::from("Rendered mode requires HTML content."),
+                        Line::from("Switch to Text mode (v)."),
+                    ])
+                } else if render_tile_count == 0 && renderer_is_chromium {
+                    Text::from(vec![
+                        Line::from(""),
+                        Line::from("Rendered mode ready, but no tiles were produced."),
+                        Line::from("If Chromium is not installed, install it and retry."),
+                        Line::from("Or set RATMAIL_RENDERER=null to disable rendering."),
+                    ])
                 } else {
                     Text::from(vec![
                         Line::from(""),
                         Line::from("(HTML email rendered as image tiles via kitty/sixel)"),
                         Line::from(""),
-                        Line::from("Scroll:  0%  (PgDn/PgUp)"),
+                        Line::from(format!("Tiles: {}  (PgDn/PgUp)", render_tile_count)),
                         Line::from("Links: [l]  Attach: [a]"),
                     ])
                 }
@@ -659,7 +1079,40 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &App, scroll
             .constraints([Constraint::Min(8), Constraint::Length(4)])
             .split(area);
 
-        frame.render_widget(content_block, chunks[0]);
+        if view_mode == ViewMode::Rendered && render_supported && protocol_available {
+            let desired_idx = app.view_scroll as usize;
+            let area_key = (chunks[0].width, chunks[0].height);
+            if app.last_render_area != Some(area_key) {
+                app.protocol_cache.clear();
+                app.protocol_cache_lru.clear();
+                app.last_render_area = Some(area_key);
+                app.image_protocol = None;
+            }
+
+            if app.render_tile_index != desired_idx || app.image_protocol.is_none() {
+                if let Some(protocol) = app.take_cached_protocol(detail.id, desired_idx) {
+                    app.image_protocol = Some(protocol);
+                    app.render_tile_index = desired_idx;
+                } else if let Some(bytes) = app.render_tiles.get(desired_idx).map(|t| t.bytes.clone()) {
+                    if let Ok(img) = image::load_from_memory(&bytes) {
+                        if let Some(picker) = app.image_picker.as_mut() {
+                            let protocol = picker.new_resize_protocol(img);
+                            app.render_tile_index = desired_idx;
+                            app.store_protocol_cache(detail.id, desired_idx, protocol);
+                            app.image_protocol = app.take_cached_protocol(detail.id, desired_idx);
+                        }
+                    }
+                }
+            }
+
+            if let Some(protocol) = app.image_protocol.as_mut() {
+                frame.render_stateful_widget(StatefulImage::default(), chunks[0], protocol);
+            } else {
+                frame.render_widget(content_block, chunks[0]);
+            }
+        } else {
+            frame.render_widget(content_block, chunks[0]);
+        }
         frame.render_widget(Paragraph::new(meta_block), chunks[1]);
     } else {
         let block = Block::default().borders(Borders::ALL).title(title);
@@ -692,7 +1145,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let popup = centered_rect(80, 60, area);
     frame.render_widget(Clear, popup);
 
@@ -724,7 +1177,7 @@ fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, popup);
 }
 
-fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let popup = centered_rect(70, 50, area);
     frame.render_widget(Clear, popup);
 
@@ -773,7 +1226,7 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
-fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App) {
+fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &mut App) {
     let popup = centered_rect(90, 80, area);
     frame.render_widget(Clear, popup);
 
@@ -809,7 +1262,7 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App) {
     frame.render_widget(paragraph, popup);
 }
 
-fn render_view_focus(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_view_focus(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let popup = centered_rect(90, 85, area);
     frame.render_widget(Clear, popup);
     render_message_view(frame, popup, app, app.view_scroll);

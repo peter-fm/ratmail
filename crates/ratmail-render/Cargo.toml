@@ -9,5 +9,8 @@ anyhow.workspace = true
 serde.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
+image.workspace = true
+headless_chrome.workspace = true
+base64.workspace = true
 
 ratmail-core = { path = "../ratmail-core" }

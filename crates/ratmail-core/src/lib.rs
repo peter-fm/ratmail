@@ -288,6 +288,63 @@ Want to grab lunch today? I am free around noon.\r\n",
 
         Ok(())
     }
+
+    pub async fn touch_cache_tiles(
+        &self,
+        message_id: i64,
+        width_px: i64,
+        theme: &str,
+        remote_policy: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE cache_tiles SET updated_at = datetime('now')
+             WHERE message_id = ? AND width_px = ? AND theme = ? AND remote_policy = ?",
+        )
+        .bind(message_id)
+        .bind(width_px)
+        .bind(theme)
+        .bind(remote_policy)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn cache_tiles_total_bytes(&self) -> Result<i64> {
+        let row = sqlx::query_as::<_, (Option<i64>,)>(
+            "SELECT SUM(LENGTH(png_bytes)) FROM cache_tiles",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0.unwrap_or(0))
+    }
+
+    pub async fn prune_cache_tiles(&self, max_bytes: i64) -> Result<()> {
+        let mut total = self.cache_tiles_total_bytes().await?;
+        if total <= max_bytes {
+            return Ok(());
+        }
+
+        while total > max_bytes {
+            let deleted = sqlx::query(
+                "DELETE FROM cache_tiles
+                 WHERE rowid IN (
+                    SELECT rowid FROM cache_tiles
+                    ORDER BY updated_at ASC
+                    LIMIT 50
+                 )",
+            )
+            .execute(&self.pool)
+            .await?
+            .rows_affected() as i64;
+
+            if deleted == 0 {
+                break;
+            }
+
+            total = self.cache_tiles_total_bytes().await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -451,6 +508,11 @@ impl MailStore for SqliteMailStore {
         .bind(remote_policy)
         .fetch_all(&self.pool)
         .await?;
+
+        if !rows.is_empty() {
+            self.touch_cache_tiles(message_id, width_px, theme, remote_policy)
+                .await?;
+        }
 
         Ok(rows
             .into_iter()
