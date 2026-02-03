@@ -28,12 +28,12 @@ use std::sync::Arc;
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
-const RENDER_DEBOUNCE: Duration = Duration::from_millis(200);
+const RENDER_DEBOUNCE: Duration = Duration::from_millis(120);
 const RENDER_PREFETCH_NEXT: usize = 2;
 const RENDER_PREFETCH_PREV: usize = 1;
 const TILE_CACHE_BUDGET_BYTES: i64 = 256 * 1024 * 1024;
 const RENDER_MEM_CACHE_LIMIT: usize = 32;
-const PROTOCOL_CACHE_LIMIT: usize = 16;
+const PROTOCOL_CACHE_LIMIT: usize = 32;
 
 #[derive(Debug, Clone)]
 struct RenderRequest {
@@ -266,6 +266,7 @@ impl App {
         }
         self.insert_render_cache(message_id, tiles.clone());
         self.apply_render_tiles(message_id, tiles);
+        self.prewarm_protocol_cache(message_id);
         true
     }
 
@@ -363,7 +364,30 @@ impl App {
         let tiles = event.tiles;
         self.insert_render_cache(event.message_id, tiles.clone());
         self.apply_render_tiles(event.message_id, tiles);
+        self.prewarm_protocol_cache(event.message_id);
         self.render_pending = false;
+    }
+
+    fn prewarm_protocol_cache(&mut self, message_id: i64) {
+        if self.image_picker.is_none() {
+            return;
+        }
+        let start = self.render_tile_index;
+        let end = (start + 2).min(self.render_tiles.len().saturating_sub(1));
+        for idx in start..=end {
+            let key = (message_id, idx);
+            if self.protocol_cache.contains_key(&key) {
+                continue;
+            }
+            if let Some(bytes) = self.render_tiles.get(idx).map(|t| t.bytes.clone()) {
+                if let Ok(img) = image::load_from_memory(&bytes) {
+                    if let Some(picker) = self.image_picker.as_mut() {
+                        let protocol = picker.new_resize_protocol(img);
+                        self.store_protocol_cache(message_id, idx, protocol);
+                    }
+                }
+            }
+        }
     }
 
     fn ensure_text_cache_for_selected(&mut self) {
@@ -1010,6 +1034,10 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
     let protocol_available = app.image_picker.is_some();
 
     if let Some(detail) = detail {
+        let outer = Block::default().borders(Borders::ALL).title(title);
+        let inner = outer.inner(area);
+        frame.render_widget(outer, area);
+
         let meta_block = Text::from(vec![
             Line::from(Span::styled(
                 format!("Subject: {}", detail.subject),
@@ -1070,18 +1098,18 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
         };
 
         let content_block = Paragraph::new(content_text)
-            .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(8), Constraint::Length(4)])
-            .split(area);
+            .constraints([Constraint::Length(4), Constraint::Min(8)])
+            .split(inner);
 
+        let content_area = chunks[1];
         if view_mode == ViewMode::Rendered && render_supported && protocol_available {
             let desired_idx = app.view_scroll as usize;
-            let area_key = (chunks[0].width, chunks[0].height);
+            let area_key = (content_area.width, content_area.height);
             if app.last_render_area != Some(area_key) {
                 app.protocol_cache.clear();
                 app.protocol_cache_lru.clear();
@@ -1106,14 +1134,14 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
             }
 
             if let Some(protocol) = app.image_protocol.as_mut() {
-                frame.render_stateful_widget(StatefulImage::default(), chunks[0], protocol);
+                frame.render_stateful_widget(StatefulImage::default(), content_area, protocol);
             } else {
-                frame.render_widget(content_block, chunks[0]);
+                frame.render_widget(content_block, content_area);
             }
         } else {
-            frame.render_widget(content_block, chunks[0]);
+            frame.render_widget(content_block, content_area);
         }
-        frame.render_widget(Paragraph::new(meta_block), chunks[1]);
+        frame.render_widget(Paragraph::new(meta_block), chunks[0]);
     } else {
         let block = Block::default().borders(Borders::ALL).title(title);
         frame.render_widget(Paragraph::new("No message selected").block(block), area);
