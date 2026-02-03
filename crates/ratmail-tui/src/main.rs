@@ -17,6 +17,7 @@ use ratatui::{
 };
 
 use ratmail_core::{MailStore, MessageDetail, MessageSummary, SqliteMailStore, StoreSnapshot};
+use ratmail_mail::{MailCommand, MailEngine, MailEvent};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
 
@@ -41,16 +42,26 @@ struct App {
     store: StoreSnapshot,
     message_index: usize,
     last_tick: Instant,
+    sync_status: String,
+    engine: MailEngine,
+    events: tokio::sync::mpsc::UnboundedReceiver<MailEvent>,
 }
 
 impl App {
-    fn new(store: StoreSnapshot) -> Self {
+    fn new(
+        store: StoreSnapshot,
+        engine: MailEngine,
+        events: tokio::sync::mpsc::UnboundedReceiver<MailEvent>,
+    ) -> Self {
         Self {
             mode: Mode::List,
             view_mode: ViewMode::Rendered,
             store,
             message_index: 0,
             last_tick: Instant::now(),
+            sync_status: "idle".to_string(),
+            engine,
+            events,
         }
     }
 
@@ -71,6 +82,15 @@ impl App {
         }
     }
 
+    fn on_event(&mut self, event: MailEvent) {
+        match event {
+            MailEvent::SyncStarted(_) => self.sync_status = "syncing".to_string(),
+            MailEvent::SyncCompleted(_) => self.sync_status = "idle".to_string(),
+            MailEvent::SyncFailed { .. } => self.sync_status = "error".to_string(),
+            _ => {}
+        }
+    }
+
     fn on_key_main(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) => return true,
@@ -86,6 +106,7 @@ impl App {
             }
             (KeyCode::Enter, _) => {
                 self.mode = Mode::View;
+                let _ = self.engine.send(MailCommand::SyncFolder(1));
             }
             (KeyCode::Char('v'), _) => {
                 self.view_mode = match self.view_mode {
@@ -144,6 +165,10 @@ impl App {
 
 fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
+    let (engine, events) = rt.block_on(async {
+        let (engine, events) = MailEngine::start();
+        (engine, events)
+    });
     let store = rt.block_on(async {
         let store = SqliteMailStore::connect("ratmail.db").await?;
         store.init().await?;
@@ -157,7 +182,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, App::new(store));
+    let res = run_app(&mut terminal, App::new(store, engine, events));
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -169,6 +194,10 @@ fn main() -> Result<()> {
 fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> Result<()> {
     loop {
         terminal.draw(|frame| ui(frame, &app))?;
+
+        while let Ok(event) = app.events.try_recv() {
+            app.on_event(event);
+        }
 
         let timeout = TICK_RATE.saturating_sub(app.last_tick.elapsed());
         if event::poll(timeout)? {
@@ -220,7 +249,7 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Cyan),
         ),
         Span::raw(" INBOX (2,184) "),
-        Span::raw(" sync: idle "),
+        Span::raw(format!(" sync: {} ", app.sync_status)),
         Span::styled(
             format!(" view: {} (v) ", view_label),
             Style::default().fg(Color::Yellow),

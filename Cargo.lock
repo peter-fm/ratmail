@@ -1083,6 +1083,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "ratmail-core",
+ "ratmail-mail",
  "tokio",
 ]
 
@@ -1110,8 +1111,10 @@ name = "ratmail-mail"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "ratmail-core",
  "serde",
+ "tokio",
 ]
 
 [[package]]
