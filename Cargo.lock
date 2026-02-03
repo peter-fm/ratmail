@@ -1343,6 +1343,7 @@ version = "0.1.0"
 dependencies = [
  "ammonia",
  "anyhow",
+ "base64 0.22.1",
  "html2text",
  "linkify",
  "mailparse",

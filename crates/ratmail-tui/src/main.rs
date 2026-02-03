@@ -19,7 +19,7 @@ use ratatui::{
 use ratmail_core::{
     MailStore, MessageDetail, MessageSummary, SqliteMailStore, StoreSnapshot, DEFAULT_TEXT_WIDTH,
 };
-use ratmail_content::extract_display;
+use ratmail_content::{extract_attachments, extract_display, prepare_html};
 use ratmail_mail::{MailCommand, MailEngine, MailEvent};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
@@ -132,10 +132,76 @@ impl App {
                         date: summary.date.clone(),
                         body: display.text,
                         links: display.links,
+                        attachments: Vec::new(),
                     },
                 );
             }
         }
+    }
+
+    fn ensure_attachments_for_selected(&mut self) {
+        let Some(message) = self.selected_message() else { return };
+        if let Some(detail) = self.store.message_details.get(&message.id) {
+            if !detail.attachments.is_empty() {
+                return;
+            }
+        }
+
+        let message_id = message.id;
+        let store_handle = self.store_handle.clone();
+        let result = self.runtime.block_on(async move {
+            if let Some(raw) = store_handle.get_raw_body(message_id).await? {
+                let attachments = extract_attachments(&raw)?;
+                Ok::<_, anyhow::Error>(Some(attachments))
+            } else {
+                Ok::<_, anyhow::Error>(None)
+            }
+        });
+
+        if let Ok(Some(attachments)) = result {
+            if let Some(detail) = self.store.message_details.get_mut(&message_id) {
+                detail.attachments = attachments;
+            } else if let Some(summary) = self.selected_message() {
+                self.store.message_details.insert(
+                    message_id,
+                    MessageDetail {
+                        id: message_id,
+                        subject: summary.subject.clone(),
+                        from: summary.from.clone(),
+                        date: summary.date.clone(),
+                        body: String::new(),
+                        links: Vec::new(),
+                        attachments,
+                    },
+                );
+            }
+        }
+    }
+
+    fn ensure_prepared_html_for_selected(&mut self) {
+        let Some(message) = self.selected_message() else { return };
+        let message_id = message.id;
+        let store_handle = self.store_handle.clone();
+        let result = self.runtime.block_on(async move {
+            if store_handle
+                .get_cache_html(message_id, "blocked")
+                .await?
+                .is_some()
+            {
+                return Ok::<_, anyhow::Error>(None::<()>);
+            }
+
+            if let Some(raw) = store_handle.get_raw_body(message_id).await? {
+                if let Some(prepared) = prepare_html(&raw, false)? {
+                    store_handle
+                        .upsert_cache_html(message_id, "blocked", &prepared.html)
+                        .await?;
+                }
+            }
+            Ok::<_, anyhow::Error>(None::<()>)
+        });
+
+        let _ = result;
     }
 
     fn on_event(&mut self, event: MailEvent) {
@@ -181,6 +247,8 @@ impl App {
                 };
                 if self.view_mode == ViewMode::Text {
                     self.ensure_text_cache_for_selected();
+                } else {
+                    self.ensure_prepared_html_for_selected();
                 }
             }
             (KeyCode::Char('l'), _) => {
@@ -189,6 +257,7 @@ impl App {
                 self.mode = Mode::OverlayLinks;
             }
             (KeyCode::Char('a'), _) => {
+                self.ensure_attachments_for_selected();
                 self.overlay_return = self.mode;
                 self.mode = Mode::OverlayAttach;
             }
@@ -234,6 +303,8 @@ impl App {
                 };
                 if self.view_mode == ViewMode::Text {
                     self.ensure_text_cache_for_selected();
+                } else {
+                    self.ensure_prepared_html_for_selected();
                 }
             }
             (KeyCode::Char('l'), _) => {
@@ -242,6 +313,7 @@ impl App {
                 self.mode = Mode::OverlayLinks;
             }
             (KeyCode::Char('a'), _) => {
+                self.ensure_attachments_for_selected();
                 self.overlay_return = self.mode;
                 self.mode = Mode::OverlayAttach;
             }
@@ -570,22 +642,53 @@ fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, popup);
 }
 
-fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App) {
+fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let popup = centered_rect(70, 50, area);
     frame.render_widget(Clear, popup);
 
-    let lines = vec![
-        Line::from("Message: Re: Proposal"),
-        Line::from(""),
-        Line::from("  1  proposal-v3.pdf        842 KB   application"),
-        Line::from("  2  diagram.png            128 KB   image/png"),
-        Line::from(""),
-        Line::from("Enter open  s save  y copy name  Esc close"),
-    ];
+    let mut lines = Vec::new();
+    let title = app
+        .selected_detail()
+        .map(|detail| format!("Message: {}", detail.subject))
+        .unwrap_or_else(|| "Message: (none)".to_string());
+    lines.push(Line::from(title));
+    lines.push(Line::from(""));
+
+    if let Some(detail) = app.selected_detail() {
+        if detail.attachments.is_empty() {
+            lines.push(Line::from("  (no attachments found)"));
+        } else {
+            for (idx, attachment) in detail.attachments.iter().enumerate() {
+                let size = format_size(attachment.size);
+                lines.push(Line::from(format!(
+                    "  {:>2}  {:<24} {:>7}  {}",
+                    idx + 1,
+                    attachment.filename,
+                    size,
+                    attachment.mime
+                )));
+            }
+        }
+    } else {
+        lines.push(Line::from("  (no message selected)"));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Enter open  s save  y copy name  Esc close"));
 
     let block = Block::default().borders(Borders::ALL).title("ATTACHMENTS");
     let paragraph = Paragraph::new(Text::from(lines)).block(block).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup);
+}
+
+fn format_size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{} MB", (bytes as f64 / (1024.0 * 1024.0)).round() as usize)
+    } else if bytes >= 1024 {
+        format!("{} KB", (bytes as f64 / 1024.0).round() as usize)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App) {

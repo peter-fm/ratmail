@@ -39,6 +39,7 @@ pub struct MessageDetail {
     pub date: String,
     pub body: String,
     pub links: Vec<String>,
+    pub attachments: Vec<AttachmentMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +50,13 @@ pub struct StoreSnapshot {
     pub message_details: HashMap<i64, MessageDetail>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentMeta {
+    pub filename: String,
+    pub mime: String,
+    pub size: usize,
+}
+
 pub const DEFAULT_TEXT_WIDTH: i64 = 80;
 
 #[async_trait]
@@ -56,6 +64,9 @@ pub trait MailStore: Send + Sync {
     async fn load_snapshot(&self, account_id: i64, folder_id: i64) -> Result<StoreSnapshot>;
     async fn get_raw_body(&self, message_id: i64) -> Result<Option<Vec<u8>>>;
     async fn upsert_cache_text(&self, message_id: i64, width_cols: i64, text: &str) -> Result<()>;
+    async fn get_cache_html(&self, message_id: i64, remote_policy: &str) -> Result<Option<String>>;
+    async fn upsert_cache_html(&self, message_id: i64, remote_policy: &str, html: &str)
+        -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -176,11 +187,23 @@ impl SqliteMailStore {
                 1,
                 "From: Alex Chen <alex@example.com>\r\n\
 Subject: Re: Proposal\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"boundary42\"\r\n\
+\r\n\
+--boundary42\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 Thanks - this looks good overall.\r\n\
 \r\n\
-I've added comments to section 3 regarding timelines.\r\n",
+I've added comments to section 3 regarding timelines.\r\n\
+\r\n\
+--boundary42\r\n\
+Content-Type: application/pdf\r\n\
+Content-Disposition: attachment; filename=\"proposal-v3.pdf\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+JVBERi0xLjQKJcTl8uXr\r\n\
+--boundary42--\r\n",
             ),
             (
                 2,
@@ -230,19 +253,15 @@ Want to grab lunch today? I am free around noon.\r\n",
             ),
         ];
 
-        let body_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM bodies")
-            .fetch_one(&self.pool)
+        for (message_id, raw) in raw_messages {
+            sqlx::query(
+                "INSERT INTO bodies (message_id, raw_bytes) VALUES (?, ?)
+                 ON CONFLICT(message_id) DO UPDATE SET raw_bytes = excluded.raw_bytes",
+            )
+            .bind(message_id)
+            .bind(raw.as_bytes())
+            .execute(&self.pool)
             .await?;
-        if body_count.0 == 0 {
-            for (message_id, raw) in raw_messages {
-                sqlx::query(
-                    "INSERT INTO bodies (message_id, raw_bytes) VALUES (?, ?)",
-                )
-                .bind(message_id)
-                .bind(raw.as_bytes())
-                .execute(&self.pool)
-                .await?;
-            }
         }
 
         Ok(())
@@ -298,6 +317,7 @@ impl MailStore for SqliteMailStore {
                         date,
                         body,
                         links: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 );
             }
@@ -354,6 +374,37 @@ impl MailStore for SqliteMailStore {
         .bind(message_id)
         .bind(width_cols)
         .bind(text)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_cache_html(&self, message_id: i64, remote_policy: &str) -> Result<Option<String>> {
+        let row = sqlx::query_as::<_, (String,)>(
+            "SELECT prepared_html FROM cache_html WHERE message_id = ? AND remote_policy = ?",
+        )
+        .bind(message_id)
+        .bind(remote_policy)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    async fn upsert_cache_html(
+        &self,
+        message_id: i64,
+        remote_policy: &str,
+        html: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO cache_html (message_id, remote_policy, prepared_html, updated_at)
+             VALUES (?, ?, ?, datetime('now'))
+             ON CONFLICT(message_id, remote_policy)
+             DO UPDATE SET prepared_html = excluded.prepared_html, updated_at = excluded.updated_at",
+        )
+        .bind(message_id)
+        .bind(remote_policy)
+        .bind(html)
         .execute(&self.pool)
         .await?;
         Ok(())
