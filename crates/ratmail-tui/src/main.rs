@@ -16,7 +16,7 @@ use ratatui::{
     Terminal,
 };
 
-use ratmail_core::{FakeStore, MessageSummary};
+use ratmail_core::{MailStore, MessageDetail, MessageSummary, SqliteMailStore, StoreSnapshot};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
 
@@ -38,19 +38,17 @@ enum ViewMode {
 struct App {
     mode: Mode,
     view_mode: ViewMode,
-    store: FakeStore,
-    folder_index: usize,
+    store: StoreSnapshot,
     message_index: usize,
     last_tick: Instant,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(store: StoreSnapshot) -> Self {
         Self {
             mode: Mode::List,
             view_mode: ViewMode::Rendered,
-            store: FakeStore::demo(),
-            folder_index: 0,
+            store,
             message_index: 0,
             last_tick: Instant::now(),
         }
@@ -58,6 +56,11 @@ impl App {
 
     fn selected_message(&self) -> Option<&MessageSummary> {
         self.store.messages.get(self.message_index)
+    }
+
+    fn selected_detail(&self) -> Option<&MessageDetail> {
+        let message_id = self.selected_message()?.id;
+        self.store.message_details.get(&message_id)
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
@@ -140,13 +143,21 @@ impl App {
 }
 
 fn main() -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let store = rt.block_on(async {
+        let store = SqliteMailStore::connect("ratmail.db").await?;
+        store.init().await?;
+        store.seed_demo_if_empty().await?;
+        store.load_snapshot(1, 1).await
+    })?;
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, App::new());
+    let res = run_app(&mut terminal, App::new(store));
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -269,20 +280,20 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, message)| {
-            let unread = if message.unread { "●" } else { " " };
+            let unread = if message.unread { "*" } else { " " };
             let style = if idx == app.message_index {
                 Style::default().bg(Color::DarkGray)
             } else {
                 Style::default()
             };
-            Row::new(vec![unread, message.time.as_str(), &message.from, &message.subject])
+            Row::new(vec![unread, message.date.as_str(), &message.from, &message.subject])
                 .style(style)
         })
         .collect();
 
     let table = Table::new(rows, [
         Constraint::Length(2),
-        Constraint::Length(7),
+        Constraint::Length(16),
         Constraint::Length(18),
         Constraint::Min(10),
     ])
@@ -306,41 +317,33 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let mut lines = Vec::new();
     let title = match app.view_mode {
         ViewMode::Text => "MESSAGE VIEW (text)",
         ViewMode::Rendered => "MESSAGE VIEW (rendered tiles)",
     };
 
-    match app.view_mode {
-        ViewMode::Rendered => {
-            lines.push(Line::from(""));
-            lines.push(Line::from("(HTML email rendered as image tiles via kitty/sixel)"));
-            lines.push(Line::from(""));
-            lines.push(Line::from("Scroll: 38% (PgDn/PgUp)"));
-            lines.push(Line::from("Links: [l]  Attach: [a]"));
-        }
-        ViewMode::Text => {
-            lines.push(Line::from("Thanks — this looks good overall."));
-            lines.push(Line::from(""));
-            lines.push(Line::from("I've added comments to section 3 regarding timelines."));
-            lines.push(Line::from(""));
-            lines.push(Line::from("> On Feb 3, 2026, Alex Chen wrote:"));
-            lines.push(Line::from("> Attached is the updated proposal..."));
-        }
-    }
-
-    if app.selected_message().is_some() {
+    if let Some(detail) = app.selected_detail() {
         let meta_block = Text::from(vec![
             Line::from(Span::styled(
-                format!("Subject: {}", app.store.message_meta.subject),
+                format!("Subject: {}", detail.subject),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
-            Line::from(format!("From: {}", app.store.message_meta.from)),
-            Line::from(format!("Date: {}", app.store.message_meta.date)),
+            Line::from(format!("From: {}", detail.from)),
+            Line::from(format!("Date: {}", detail.date)),
         ]);
 
-        let content_block = Paragraph::new(Text::from(lines))
+        let content_text = match app.view_mode {
+            ViewMode::Rendered => Text::from(vec![
+                Line::from(""),
+                Line::from("(HTML email rendered as image tiles via kitty/sixel)"),
+                Line::from(""),
+                Line::from("Scroll: 38% (PgDn/PgUp)"),
+                Line::from("Links: [l]  Attach: [a]"),
+            ]),
+            ViewMode::Text => Text::from(detail.body.as_str()),
+        };
+
+        let content_block = Paragraph::new(content_text)
             .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false });
 
@@ -382,7 +385,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App) {
     let popup = centered_rect(80, 60, area);
     frame.render_widget(Clear, popup);
 
@@ -402,7 +405,7 @@ fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, popup);
 }
 
-fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App) {
     let popup = centered_rect(70, 50, area);
     frame.render_widget(Clear, popup);
 
@@ -420,7 +423,7 @@ fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, popup);
 }
 
-fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &App) {
     let popup = centered_rect(90, 80, area);
     frame.render_widget(Clear, popup);
 
