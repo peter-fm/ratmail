@@ -17,6 +17,8 @@ ratmail-render = { path = "../ratmail-render" }
 ratatui-image.workspace = true
 image.workspace = true
 open.workspace = true
+toml.workspace = true
+tui-textarea.workspace = true
 
 [[bin]]
 name = "ratmail"

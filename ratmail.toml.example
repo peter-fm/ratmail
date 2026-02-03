@@ -1,0 +1,9 @@
+# Copy to ratmail.toml and fill in your SMTP credentials.
+# Keep this file private (do not commit).
+
+[smtp]
+host = "smtp.example.com"
+port = 587
+username = "user@example.com"
+password = "app-password-or-smtp-password"
+from = "Your Name <user@example.com>"

@@ -22,10 +22,11 @@ use ratmail_core::{
     DEFAULT_TEXT_WIDTH,
 };
 use ratmail_content::{extract_attachments, extract_display, prepare_html};
-use ratmail_mail::{MailCommand, MailEngine, MailEvent};
+use ratmail_mail::{MailCommand, MailEngine, MailEvent, SmtpConfig};
 use ratmail_render::{detect_image_support, ChromiumRenderer, NullRenderer, RemotePolicy, Renderer};
 use std::sync::Arc;
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
+use tui_textarea::{Input, Key, TextArea};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(0);
@@ -69,6 +70,13 @@ enum Focus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeFocus {
+    To,
+    Subject,
+    Body,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Text,
     Rendered,
@@ -109,6 +117,11 @@ struct App {
     protocol_cache_lru: VecDeque<(i64, usize)>,
     last_render_area: Option<(u16, u16)>,
     link_index: usize,
+    status_message: Option<String>,
+    compose_to: TextArea<'static>,
+    compose_subject: TextArea<'static>,
+    compose_body: TextArea<'static>,
+    compose_focus: ComposeFocus,
 }
 
 impl App {
@@ -159,6 +172,11 @@ impl App {
             protocol_cache_lru: VecDeque::new(),
             last_render_area: None,
             link_index: 0,
+            status_message: None,
+            compose_to: new_single_line(""),
+            compose_subject: new_single_line(""),
+            compose_body: TextArea::new(Vec::new()),
+            compose_focus: ComposeFocus::Body,
         };
         if app.view_mode == ViewMode::Rendered {
             app.schedule_render();
@@ -195,6 +213,23 @@ impl App {
             Mode::Compose => self.on_key_compose(key),
             Mode::OverlayLinks | Mode::OverlayAttach => self.on_key_overlay(key),
         }
+    }
+
+    fn start_compose_new(&mut self) {
+        self.compose_to = new_single_line("");
+        self.compose_subject = new_single_line("");
+        self.compose_body = TextArea::new(Vec::new());
+        self.compose_focus = ComposeFocus::To;
+        self.mode = Mode::Compose;
+    }
+
+    fn start_compose_reply(&mut self) {
+        let (to, subject, body) = build_reply(self.selected_detail());
+        self.compose_to = new_single_line(&to);
+        self.compose_subject = new_single_line(&subject);
+        self.compose_body = TextArea::new(body.lines().map(|s| s.to_string()).collect());
+        self.compose_focus = ComposeFocus::Body;
+        self.mode = Mode::Compose;
     }
 
     fn on_tick(&mut self) {
@@ -504,6 +539,15 @@ impl App {
             MailEvent::SyncStarted(_) => self.sync_status = "syncing".to_string(),
             MailEvent::SyncCompleted(_) => self.sync_status = "idle".to_string(),
             MailEvent::SyncFailed { .. } => self.sync_status = "error".to_string(),
+            MailEvent::SendStarted => {
+                self.status_message = Some("Sending...".to_string());
+            }
+            MailEvent::SendCompleted => {
+                self.status_message = Some("Sent".to_string());
+            }
+            MailEvent::SendFailed { reason } => {
+                self.status_message = Some(format!("Send failed: {}", reason));
+            }
             _ => {}
         }
     }
@@ -602,13 +646,16 @@ impl App {
                 self.mode = Mode::OverlayAttach;
             }
             (KeyCode::Char('r'), _) => {
-                self.mode = Mode::Compose;
+                self.start_compose_reply();
             }
             (KeyCode::Char('R'), _) => {
-                self.mode = Mode::Compose;
+                self.start_compose_reply();
             }
             (KeyCode::Char('f'), _) => {
-                self.mode = Mode::Compose;
+                self.start_compose_reply();
+            }
+            (KeyCode::Char('c'), _) => {
+                self.start_compose_new();
             }
             _ => {}
         }
@@ -658,13 +705,13 @@ impl App {
                 self.mode = Mode::OverlayAttach;
             }
             (KeyCode::Char('r'), _) => {
-                self.mode = Mode::Compose;
+                self.start_compose_reply();
             }
             (KeyCode::Char('R'), _) => {
-                self.mode = Mode::Compose;
+                self.start_compose_reply();
             }
             (KeyCode::Char('f'), _) => {
-                self.mode = Mode::Compose;
+                self.start_compose_reply();
             }
             (KeyCode::Esc, _) => {
                 self.mode = Mode::View;
@@ -720,7 +767,30 @@ impl App {
         false
     }
 
-fn on_key_compose(&mut self, key: KeyEvent) -> bool {
+    fn on_key_compose(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if matches!(key.code, KeyCode::F(5))
+            || (ctrl
+                && matches!(
+                    key.code,
+                    KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('\u{13}')
+                ))
+        {
+                let to = textarea_single_line(&self.compose_to);
+                let subject = textarea_single_line(&self.compose_subject);
+                let body = textarea_text(&self.compose_body);
+                if to.trim().is_empty() {
+                    self.status_message = Some("No recipient".to_string());
+                } else {
+                    self.status_message = Some("Sending...".to_string());
+                    let _ = self.engine.send(MailCommand::SendMessage {
+                        to,
+                        subject,
+                        body,
+                    });
+                }
+            return false;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                 self.mode = Mode::View;
@@ -728,7 +798,41 @@ fn on_key_compose(&mut self, key: KeyEvent) -> bool {
             (KeyCode::Esc, _) => {
                 self.mode = Mode::View;
             }
-            _ => {}
+            (KeyCode::Tab, _) | (KeyCode::Char('\t'), _) => {
+                self.compose_focus = match self.compose_focus {
+                    ComposeFocus::To => ComposeFocus::Subject,
+                    ComposeFocus::Subject => ComposeFocus::Body,
+                    ComposeFocus::Body => ComposeFocus::To,
+                };
+            }
+            (KeyCode::Enter, _) | (KeyCode::Char('\n'), _) | (KeyCode::Char('\r'), _) => {
+                match self.compose_focus {
+                    ComposeFocus::To => self.compose_focus = ComposeFocus::Subject,
+                    ComposeFocus::Subject => self.compose_focus = ComposeFocus::Body,
+                    ComposeFocus::Body => {
+                        let input = Input::from(key);
+                        self.compose_body.input(input);
+                    }
+                }
+            }
+            _ => {
+                let input = Input::from(key);
+                match self.compose_focus {
+                    ComposeFocus::To => {
+                        if !is_enter_key(&input) {
+                            self.compose_to.input(input);
+                        }
+                    }
+                    ComposeFocus::Subject => {
+                        if !is_enter_key(&input) {
+                            self.compose_subject.input(input);
+                        }
+                    }
+                    ComposeFocus::Body => {
+                        self.compose_body.input(input);
+                    }
+                }
+            }
         }
         false
     }
@@ -880,8 +984,9 @@ async fn render_worker(
 
 fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
+    let smtp = load_smtp_config();
     let (engine, events, store_handle, store) = rt.block_on(async {
-        let (engine, events) = MailEngine::start();
+        let (engine, events) = MailEngine::start(smtp);
         let store_handle = SqliteMailStore::connect("ratmail.db").await?;
         store_handle.init().await?;
         store_handle.seed_demo_if_empty().await?;
@@ -1005,7 +1110,7 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         ViewMode::Rendered => "RENDERED",
     };
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" acct: {} ", app.store.account.address),
             Style::default().fg(Color::Cyan),
@@ -1017,11 +1122,16 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow),
         ),
         Span::raw(" [/] search "),
-    ]);
+    ];
+    if let Some(msg) = &app.status_message {
+        spans.push(Span::raw(format!(" | {}", msg)));
+    }
+    let line = Line::from(spans);
 
     let block = Block::default().borders(Borders::BOTTOM);
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
+
 
 fn render_main(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let columns = Layout::default()
@@ -1244,7 +1354,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
 }
 
 fn render_help_bar(frame: &mut ratatui::Frame, area: Rect) {
-    let help = "Tab/h/l focus  j/k move  Enter open  v toggle view  r reply  R reply-all  f forward  m move  d delete  q quit";
+    let help = "Tab/h/l focus  j/k move  Enter open  v toggle view  Ctrl+S/F5 send  r reply  R reply-all  f forward  m move  d delete  q quit";
     let block = Block::default().borders(Borders::TOP);
     frame.render_widget(Paragraph::new(help).block(block), area);
 }
@@ -1357,44 +1467,158 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
-fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, _app: &mut App) {
+fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let popup = centered_rect(90, 80, area);
     frame.render_widget(Clear, popup);
 
-    let lines = vec![
-        Line::from("To:   Alex Chen <alex@example.com>"),
-        Line::from("Cc:"),
-        Line::from("Subj: Re: Proposal"),
-        Line::from(""),
-        Line::from("Thanks — this looks good overall."),
-        Line::from(""),
-        Line::from("I've added comments to section 3 regarding timelines."),
-        Line::from(""),
-        Line::from("> On Feb 3, 2026, Alex Chen wrote:"),
-        Line::from(">"),
-        Line::from("> Hi,"),
-        Line::from(">"),
-        Line::from("> Attached is the updated proposal. Let me know if this"),
-        Line::from("> works for you."),
-        Line::from(">"),
-        Line::from("> Best,"),
-        Line::from("> Alex"),
-        Line::from(""),
-        Line::from("Attachments: proposal-v3.pdf"),
-        Line::from(""),
-        Line::from("Ctrl+S send   Ctrl+A attach   Ctrl+Q cancel   Ctrl+E edit headers"),
-    ];
+    let outer = Block::default().borders(Borders::ALL).title("COMPOSE");
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
 
-    let block = Block::default().borders(Borders::ALL).title("COMPOSE");
-    let paragraph = Paragraph::new(Text::from(lines))
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(inner);
 
-    frame.render_widget(paragraph, popup);
+    let label_style = Style::default().fg(Color::Gray);
+    let to_label = if app.compose_focus == ComposeFocus::To {
+        Style::default().fg(Color::Yellow)
+    } else {
+        label_style
+    };
+    let subject_label = if app.compose_focus == ComposeFocus::Subject {
+        Style::default().fg(Color::Yellow)
+    } else {
+        label_style
+    };
+    // Ensure only the focused field shows a cursor.
+    let inactive_cursor = Style::default();
+    let active_cursor = Style::default().add_modifier(Modifier::REVERSED);
+    app.compose_to.set_cursor_line_style(Style::default());
+    app.compose_subject.set_cursor_line_style(Style::default());
+    app.compose_body.set_cursor_line_style(Style::default());
+    app.compose_to
+        .set_cursor_style(if app.compose_focus == ComposeFocus::To {
+            active_cursor
+        } else {
+            inactive_cursor
+        });
+    app.compose_subject
+        .set_cursor_style(if app.compose_focus == ComposeFocus::Subject {
+            active_cursor
+        } else {
+            inactive_cursor
+        });
+    app.compose_body
+        .set_cursor_style(if app.compose_focus == ComposeFocus::Body {
+            active_cursor
+        } else {
+            inactive_cursor
+        });
+
+    let to_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(rows[0]);
+    frame.render_widget(Paragraph::new("To:").style(to_label), to_layout[0]);
+    frame.render_widget(&app.compose_to, to_layout[1]);
+
+    let cc_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(rows[1]);
+    frame.render_widget(Paragraph::new("Cc:").style(label_style), cc_layout[0]);
+
+    let subject_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(rows[2]);
+    frame.render_widget(Paragraph::new("Subj:").style(subject_label), subject_layout[0]);
+    frame.render_widget(&app.compose_subject, subject_layout[1]);
+
+    let line = "─".repeat(rows[3].width as usize);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().fg(Color::DarkGray)),
+        rows[3],
+    );
+    frame.render_widget(&app.compose_body, rows[4]);
+
+    let footer = if let Some(msg) = &app.status_message {
+        format!("Ctrl+S/F5 send   Tab next field   Ctrl+Q cancel   | {}", msg)
+    } else {
+        "Ctrl+S/F5 send   Tab next field   Ctrl+Q cancel".to_string()
+    };
+    frame.render_widget(Paragraph::new(footer), rows[5]);
 }
 
 fn render_view_focus(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let popup = centered_rect(90, 85, area);
     frame.render_widget(Clear, popup);
     render_message_view(frame, popup, app, app.view_scroll);
+}
+
+fn load_smtp_config() -> Option<SmtpConfig> {
+    let path = "ratmail.toml";
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = toml::from_str(&content).ok()?;
+    let smtp = value.get("smtp")?;
+    Some(SmtpConfig {
+        host: smtp.get("host")?.as_str()?.to_string(),
+        port: smtp.get("port").and_then(|v| v.as_integer()).unwrap_or(587) as u16,
+        username: smtp.get("username")?.as_str()?.to_string(),
+        password: smtp.get("password")?.as_str()?.to_string(),
+        from: smtp.get("from")?.as_str()?.to_string(),
+    })
+}
+
+fn build_reply(detail: Option<&MessageDetail>) -> (String, String, String) {
+    let Some(detail) = detail else {
+        return (String::new(), "Re:".to_string(), String::new());
+    };
+    let to = extract_email(&detail.from);
+    let subject = if detail.subject.to_lowercase().starts_with("re:") {
+        detail.subject.clone()
+    } else {
+        format!("Re: {}", detail.subject)
+    };
+    let mut body = String::new();
+    body.push_str("\n\n");
+    body.push_str(&format!("> On {}, {} wrote:\n", detail.date, detail.from));
+    for line in detail.body.lines() {
+        body.push_str("> ");
+        body.push_str(line);
+        body.push('\n');
+    }
+    (to, subject, body)
+}
+
+fn extract_email(input: &str) -> String {
+    let trimmed = input.trim();
+    if let (Some(start), Some(end)) = (trimmed.find('<'), trimmed.find('>')) {
+        return trimmed[start + 1..end].trim().to_string();
+    }
+    trimmed.to_string()
+}
+
+fn new_single_line(text: &str) -> TextArea<'static> {
+    TextArea::new(vec![text.to_string()])
+}
+
+fn textarea_single_line(area: &TextArea<'static>) -> String {
+    area.lines().first().cloned().unwrap_or_default()
+}
+
+fn textarea_text(area: &TextArea<'static>) -> String {
+    area.lines().join("\n")
+}
+
+fn is_enter_key(input: &Input) -> bool {
+    matches!(input.key, Key::Enter)
 }

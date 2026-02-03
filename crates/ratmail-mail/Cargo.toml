@@ -9,5 +9,6 @@ anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 tokio.workspace = true
+lettre.workspace = true
 
 ratmail-core = { path = "../ratmail-core" }
