@@ -1,0 +1,457 @@
+use std::io::{self, Stdout};
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Wrap},
+    Terminal,
+};
+
+use ratmail_core::{FakeStore, MessageSummary};
+
+const TICK_RATE: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    List,
+    View,
+    Compose,
+    OverlayLinks,
+    OverlayAttach,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Text,
+    Rendered,
+}
+
+struct App {
+    mode: Mode,
+    view_mode: ViewMode,
+    store: FakeStore,
+    folder_index: usize,
+    message_index: usize,
+    last_tick: Instant,
+}
+
+impl App {
+    fn new() -> Self {
+        Self {
+            mode: Mode::List,
+            view_mode: ViewMode::Rendered,
+            store: FakeStore::demo(),
+            folder_index: 0,
+            message_index: 0,
+            last_tick: Instant::now(),
+        }
+    }
+
+    fn selected_message(&self) -> Option<&MessageSummary> {
+        self.store.messages.get(self.message_index)
+    }
+
+    fn on_key(&mut self, key: KeyEvent) -> bool {
+        match self.mode {
+            Mode::List | Mode::View => self.on_key_main(key),
+            Mode::Compose => self.on_key_compose(key),
+            Mode::OverlayLinks | Mode::OverlayAttach => self.on_key_overlay(key),
+        }
+    }
+
+    fn on_key_main(&mut self, key: KeyEvent) -> bool {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) => return true,
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
+                if self.message_index + 1 < self.store.messages.len() {
+                    self.message_index += 1;
+                }
+            }
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+                if self.message_index > 0 {
+                    self.message_index -= 1;
+                }
+            }
+            (KeyCode::Enter, _) => {
+                self.mode = Mode::View;
+            }
+            (KeyCode::Char('v'), _) => {
+                self.view_mode = match self.view_mode {
+                    ViewMode::Text => ViewMode::Rendered,
+                    ViewMode::Rendered => ViewMode::Text,
+                };
+            }
+            (KeyCode::Char('l'), _) => {
+                if self.mode == Mode::View {
+                    self.mode = Mode::OverlayLinks;
+                }
+            }
+            (KeyCode::Char('a'), _) => {
+                if self.mode == Mode::View {
+                    self.mode = Mode::OverlayAttach;
+                }
+            }
+            (KeyCode::Char('r'), _) => {
+                self.mode = Mode::Compose;
+            }
+            (KeyCode::Char('R'), _) => {
+                self.mode = Mode::Compose;
+            }
+            (KeyCode::Char('f'), _) => {
+                self.mode = Mode::Compose;
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn on_key_overlay(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::View;
+            }
+            KeyCode::Char('q') => return true,
+            _ => {}
+        }
+        false
+    }
+
+    fn on_key_compose(&mut self, key: KeyEvent) -> bool {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
+                self.mode = Mode::View;
+            }
+            (KeyCode::Esc, _) => {
+                self.mode = Mode::View;
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
+fn main() -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let res = run_app(&mut terminal, App::new());
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    res
+}
+
+fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> Result<()> {
+    loop {
+        terminal.draw(|frame| ui(frame, &app))?;
+
+        let timeout = TICK_RATE.saturating_sub(app.last_tick.elapsed());
+        if event::poll(timeout)? {
+            if let Event::Key(key) = event::read()? {
+                if app.on_key(key) {
+                    return Ok(());
+                }
+            }
+        }
+
+        if app.last_tick.elapsed() >= TICK_RATE {
+            app.last_tick = Instant::now();
+        }
+    }
+}
+
+fn ui(frame: &mut ratatui::Frame, app: &App) {
+    let area = frame.area();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    render_status_bar(frame, layout[0], app);
+    render_main(frame, layout[1], app);
+    render_help_bar(frame, layout[2]);
+
+    match app.mode {
+        Mode::OverlayLinks => render_links_overlay(frame, area, app),
+        Mode::OverlayAttach => render_attach_overlay(frame, area, app),
+        Mode::Compose => render_compose_overlay(frame, area, app),
+        _ => {}
+    }
+}
+
+fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let view_label = match app.view_mode {
+        ViewMode::Text => "TEXT",
+        ViewMode::Rendered => "RENDERED",
+    };
+
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" acct: {} ", app.store.account.address),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw(" INBOX (2,184) "),
+        Span::raw(" sync: idle "),
+        Span::styled(
+            format!(" view: {} (v) ", view_label),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::raw(" [/] search "),
+    ]);
+
+    let block = Block::default().borders(Borders::BOTTOM);
+    frame.render_widget(Paragraph::new(line).block(block), area);
+}
+
+fn render_main(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(15),
+            Constraint::Percentage(40),
+            Constraint::Percentage(45),
+        ])
+        .split(area);
+
+    render_folders(frame, columns[0], app);
+    render_message_list(frame, columns[1], app);
+    render_message_view(frame, columns[2], app);
+}
+
+fn render_folders(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let items: Vec<Line> = app
+        .store
+        .folders
+        .iter()
+        .map(|folder| {
+            let label = if folder.unread > 0 {
+                format!("{}  {}", folder.name, folder.unread)
+            } else {
+                folder.name.clone()
+            };
+            Line::from(Span::raw(label))
+        })
+        .collect();
+
+    let block = Block::default().borders(Borders::RIGHT).title("FOLDERS");
+    let paragraph = Paragraph::new(items).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let header = Row::new(vec![" ", "Time", "From", "Subject"]).style(
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let rows: Vec<Row> = app
+        .store
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(idx, message)| {
+            let unread = if message.unread { "●" } else { " " };
+            let style = if idx == app.message_index {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![unread, message.time.as_str(), &message.from, &message.subject])
+                .style(style)
+        })
+        .collect();
+
+    let table = Table::new(rows, [
+        Constraint::Length(2),
+        Constraint::Length(7),
+        Constraint::Length(18),
+        Constraint::Min(10),
+    ])
+    .header(header)
+    .block(Block::default().borders(Borders::RIGHT).title("MESSAGE LIST"))
+    .column_spacing(1);
+
+    frame.render_stateful_widget(table, area, &mut TableState::default());
+
+    let preview_area = Rect {
+        x: area.x + 1,
+        y: area.y + area.height.saturating_sub(2),
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+
+    if let Some(message) = app.selected_message() {
+        let preview = format!("Preview: {}", message.preview);
+        frame.render_widget(Paragraph::new(preview), preview_area);
+    }
+}
+
+fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let mut lines = Vec::new();
+    let title = match app.view_mode {
+        ViewMode::Text => "MESSAGE VIEW (text)",
+        ViewMode::Rendered => "MESSAGE VIEW (rendered tiles)",
+    };
+
+    match app.view_mode {
+        ViewMode::Rendered => {
+            lines.push(Line::from(""));
+            lines.push(Line::from("(HTML email rendered as image tiles via kitty/sixel)"));
+            lines.push(Line::from(""));
+            lines.push(Line::from("Scroll: 38% (PgDn/PgUp)"));
+            lines.push(Line::from("Links: [l]  Attach: [a]"));
+        }
+        ViewMode::Text => {
+            lines.push(Line::from("Thanks — this looks good overall."));
+            lines.push(Line::from(""));
+            lines.push(Line::from("I've added comments to section 3 regarding timelines."));
+            lines.push(Line::from(""));
+            lines.push(Line::from("> On Feb 3, 2026, Alex Chen wrote:"));
+            lines.push(Line::from("> Attached is the updated proposal..."));
+        }
+    }
+
+    if app.selected_message().is_some() {
+        let meta_block = Text::from(vec![
+            Line::from(Span::styled(
+                format!("Subject: {}", app.store.message_meta.subject),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("From: {}", app.store.message_meta.from)),
+            Line::from(format!("Date: {}", app.store.message_meta.date)),
+        ]);
+
+        let content_block = Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false });
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(8), Constraint::Length(4)])
+            .split(area);
+
+        frame.render_widget(content_block, chunks[0]);
+        frame.render_widget(Paragraph::new(meta_block), chunks[1]);
+    } else {
+        let block = Block::default().borders(Borders::ALL).title(title);
+        frame.render_widget(Paragraph::new("No message selected").block(block), area);
+    }
+}
+
+fn render_help_bar(frame: &mut ratatui::Frame, area: Rect) {
+    let help = "j/k move  Enter open  v toggle view  r reply  R reply-all  f forward  m move  d delete  q quit";
+    let block = Block::default().borders(Borders::TOP);
+    frame.render_widget(Paragraph::new(help).block(block), area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let popup = centered_rect(80, 60, area);
+    frame.render_widget(Clear, popup);
+
+    let lines = vec![
+        Line::from("Message: Re: Proposal"),
+        Line::from(""),
+        Line::from("  1  https://docs.example.com/proposal-v3"),
+        Line::from("  2  https://calendar.example.com/meet/7fd2"),
+        Line::from("  3  https://github.com/org/repo/pull/193"),
+        Line::from("  4  mailto:alex@example.com"),
+        Line::from(""),
+        Line::from("Enter open  y copy  o open ext  Esc close"),
+    ];
+
+    let block = Block::default().borders(Borders::ALL).title("LINKS");
+    let paragraph = Paragraph::new(Text::from(lines)).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let popup = centered_rect(70, 50, area);
+    frame.render_widget(Clear, popup);
+
+    let lines = vec![
+        Line::from("Message: Re: Proposal"),
+        Line::from(""),
+        Line::from("  1  proposal-v3.pdf        842 KB   application"),
+        Line::from("  2  diagram.png            128 KB   image/png"),
+        Line::from(""),
+        Line::from("Enter open  s save  y copy name  Esc close"),
+    ];
+
+    let block = Block::default().borders(Borders::ALL).title("ATTACHMENTS");
+    let paragraph = Paragraph::new(Text::from(lines)).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let popup = centered_rect(90, 80, area);
+    frame.render_widget(Clear, popup);
+
+    let lines = vec![
+        Line::from("To:   Alex Chen <alex@example.com>"),
+        Line::from("Cc:"),
+        Line::from("Subj: Re: Proposal"),
+        Line::from(""),
+        Line::from("Thanks — this looks good overall."),
+        Line::from(""),
+        Line::from("I've added comments to section 3 regarding timelines."),
+        Line::from(""),
+        Line::from("> On Feb 3, 2026, Alex Chen wrote:"),
+        Line::from(">"),
+        Line::from("> Hi,"),
+        Line::from(">"),
+        Line::from("> Attached is the updated proposal. Let me know if this"),
+        Line::from("> works for you."),
+        Line::from(">"),
+        Line::from("> Best,"),
+        Line::from("> Alex"),
+        Line::from(""),
+        Line::from("Attachments: proposal-v3.pdf"),
+        Line::from(""),
+        Line::from("Ctrl+S send   Ctrl+A attach   Ctrl+Q cancel   Ctrl+E edit headers"),
+    ];
+
+    let block = Block::default().borders(Borders::ALL).title("COMPOSE");
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, popup);
+}
