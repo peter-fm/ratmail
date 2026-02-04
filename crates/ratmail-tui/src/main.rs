@@ -2087,27 +2087,9 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(msg), hint_area);
     }
 
-    let preview_area = Rect {
-        x: area.x + 1,
-        y: area.y + area.height.saturating_sub(2),
-        width: area.width.saturating_sub(2),
-        height: 1,
-    };
-
-    if let Some(message) = app.selected_message() {
-        let preview = format!("Preview: {}", message.preview);
-        frame.render_widget(Paragraph::new(preview), preview_area);
-    } else {
-        frame.render_widget(Paragraph::new("No messages"), preview_area);
-    }
 }
 
 fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, scroll: u16) {
-    let title = match app.view_mode {
-        ViewMode::Text => "MESSAGE VIEW (text)",
-        ViewMode::Rendered => "MESSAGE VIEW (rendered tiles)",
-    };
-
     let detail = app.selected_detail().cloned();
     let view_mode = app.view_mode;
     let render_supported = app.render_supported;
@@ -2180,17 +2162,18 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
         };
 
         let content_block = Paragraph::new(content_text)
-            .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(4), Constraint::Min(8)])
+            .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(8)])
             .split(area);
+        let separator = Block::default().borders(Borders::TOP);
+        frame.render_widget(separator, chunks[1]);
 
         if view_mode == ViewMode::Rendered && render_supported && protocol_available {
-            let content_area = chunks[1];
+            let content_area = chunks[2];
             let area_key = (content_area.width, content_area.height);
             if app.last_render_area != Some(area_key) {
                 app.protocol_cache.clear();
@@ -2283,12 +2266,11 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                 }
             }
         } else {
-            frame.render_widget(content_block, chunks[1]);
+            frame.render_widget(content_block, chunks[2]);
         }
         frame.render_widget(Paragraph::new(meta_block), chunks[0]);
     } else {
-        let block = Block::default().borders(Borders::ALL).title(title);
-        frame.render_widget(Paragraph::new("No message selected").block(block), area);
+        frame.render_widget(Paragraph::new("No message selected"), area);
     }
 }
 
@@ -2526,9 +2508,12 @@ fn set_cursor_at(frame: &mut ratatui::Frame, area: Rect, text: &str, cursor: usi
 }
 
 fn render_view_focus(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
-    let popup = centered_rect(98, 92, area);
+    let popup = centered_rect(90, 80, area);
     frame.render_widget(Clear, popup);
-    render_message_view(frame, popup, app, app.view_scroll);
+    let outer = Block::default().borders(Borders::ALL).title("MESSAGE");
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+    render_message_view(frame, inner, app, app.view_scroll);
 }
 
 fn load_smtp_config() -> Option<SmtpConfig> {
