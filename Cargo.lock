@@ -2864,6 +2864,7 @@ dependencies = [
  "anyhow",
  "crossterm 0.28.1",
  "image",
+ "mailparse",
  "open",
  "ratatui",
  "ratatui-image",

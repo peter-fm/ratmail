@@ -6,6 +6,7 @@ use lettre::{
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
 };
+use mailparse::{addrparse, MailAddr};
 use imap::{ClientBuilder, ConnectionMode};
 use imap_proto::types::Address as ProtoAddress;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,8 @@ pub enum MailCommand {
     SyncFolderByName { name: String },
     SendMessage {
         to: String,
+        cc: String,
+        bcc: String,
         subject: String,
         body: String,
     },
@@ -136,9 +139,15 @@ impl MailEngine {
                     MailCommand::SetFlag { message_id, seen } => {
                         let _ = evt_tx.send(MailEvent::FlagUpdated { message_id, seen });
                     }
-                    MailCommand::SendMessage { to, subject, body } => {
+                    MailCommand::SendMessage {
+                        to,
+                        cc,
+                        bcc,
+                        subject,
+                        body,
+                    } => {
                         let _ = evt_tx.send(MailEvent::SendStarted);
-                        let result = send_smtp(smtp.clone(), &to, &subject, &body).await;
+                        let result = send_smtp(smtp.clone(), &to, &cc, &bcc, &subject, &body).await;
                         match result {
                             Ok(()) => {
                                 let _ = evt_tx.send(MailEvent::SendCompleted);
@@ -166,18 +175,31 @@ impl MailEngine {
 async fn send_smtp(
     smtp: Option<SmtpConfig>,
     to: &str,
+    cc: &str,
+    bcc: &str,
     subject: &str,
     body: &str,
 ) -> Result<()> {
     let smtp = smtp.ok_or_else(|| anyhow!("SMTP not configured"))?;
     let from_addr = parse_mailbox(&smtp.from)?;
-    let to_addr = parse_mailbox(to)?;
+    let to_addrs = parse_mailbox_list(to)?;
+    let cc_addrs = parse_mailbox_list(cc)?;
+    let bcc_addrs = parse_mailbox_list(bcc)?;
+    if to_addrs.is_empty() && cc_addrs.is_empty() && bcc_addrs.is_empty() {
+        return Err(anyhow!("No recipients"));
+    }
 
-    let email = Message::builder()
-        .from(from_addr)
-        .to(to_addr)
-        .subject(subject)
-        .body(body.to_string())?;
+    let mut builder = Message::builder().from(from_addr).subject(subject);
+    for addr in to_addrs {
+        builder = builder.to(addr);
+    }
+    for addr in cc_addrs {
+        builder = builder.cc(addr);
+    }
+    for addr in bcc_addrs {
+        builder = builder.bcc(addr);
+    }
+    let email = builder.body(body.to_string())?;
 
     let creds = Credentials::new(smtp.username, smtp.password);
     let builder = if smtp.port == 465 {
@@ -202,6 +224,36 @@ fn parse_mailbox(input: &str) -> Result<Mailbox> {
         return Ok(Mailbox::new(Some(name.to_string()), addr.parse()?));
     }
     Ok(Mailbox::new(None, trimmed.parse()?))
+}
+
+fn parse_mailbox_list(input: &str) -> Result<Vec<Mailbox>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed = addrparse(trimmed)?;
+    Ok(mailaddrs_to_mailboxes(&parsed))
+}
+
+fn mailaddrs_to_mailboxes(addrs: &[MailAddr]) -> Vec<Mailbox> {
+    let mut out = Vec::new();
+    for addr in addrs {
+        match addr {
+            MailAddr::Single(info) => {
+                if let Ok(parsed) = info.addr.parse() {
+                    out.push(Mailbox::new(info.display_name.clone(), parsed));
+                }
+            }
+            MailAddr::Group(group) => {
+                for info in &group.addrs {
+                    if let Ok(parsed) = info.addr.parse() {
+                        out.push(Mailbox::new(info.display_name.clone(), parsed));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn sync_all_imap(imap: ImapConfig, tx: mpsc::UnboundedSender<MailEvent>) {

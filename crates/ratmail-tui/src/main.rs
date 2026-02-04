@@ -26,6 +26,7 @@ use ratmail_core::{
 use ratmail_content::{extract_attachments, extract_display, prepare_html};
 use ratmail_mail::{ImapConfig, MailCommand, MailEngine, MailEvent, SmtpConfig};
 use ratmail_render::{detect_image_support, ChromiumRenderer, NullRenderer, RemotePolicy, Renderer};
+use mailparse::{addrparse_header, MailAddr, MailHeaderMap};
 use std::sync::Arc;
 use ratatui_image::{picker::Picker, protocol::ImageSource, protocol::Protocol, protocol::StatefulProtocol, Image, Resize, StatefulImage};
 
@@ -123,8 +124,30 @@ enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposeFocus {
     To,
+    Cc,
+    Bcc,
     Subject,
     Body,
+}
+
+fn compose_focus_next(current: ComposeFocus) -> ComposeFocus {
+    match current {
+        ComposeFocus::To => ComposeFocus::Cc,
+        ComposeFocus::Cc => ComposeFocus::Bcc,
+        ComposeFocus::Bcc => ComposeFocus::Subject,
+        ComposeFocus::Subject => ComposeFocus::Body,
+        ComposeFocus::Body => ComposeFocus::To,
+    }
+}
+
+fn compose_focus_prev(current: ComposeFocus) -> ComposeFocus {
+    match current {
+        ComposeFocus::To => ComposeFocus::Body,
+        ComposeFocus::Cc => ComposeFocus::To,
+        ComposeFocus::Bcc => ComposeFocus::Cc,
+        ComposeFocus::Subject => ComposeFocus::Bcc,
+        ComposeFocus::Body => ComposeFocus::Subject,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,11 +207,15 @@ struct App {
     imap_spinner: usize,
     imap_status: Option<String>,
     compose_to: String,
+    compose_cc: String,
+    compose_bcc: String,
     compose_subject: String,
     compose_body: String,
     compose_quote: String,
     compose_focus: ComposeFocus,
     compose_cursor_to: usize,
+    compose_cursor_cc: usize,
+    compose_cursor_bcc: usize,
     compose_cursor_subject: usize,
     compose_cursor_body: usize,
     compose_body_desired_col: Option<usize>,
@@ -265,11 +292,15 @@ impl App {
             imap_spinner: 0,
             imap_status: None,
             compose_to: String::new(),
+            compose_cc: String::new(),
+            compose_bcc: String::new(),
             compose_subject: String::new(),
             compose_body: String::new(),
             compose_quote: String::new(),
             compose_focus: ComposeFocus::Body,
             compose_cursor_to: 0,
+            compose_cursor_cc: 0,
+            compose_cursor_bcc: 0,
             compose_cursor_subject: 0,
             compose_cursor_body: 0,
             compose_body_desired_col: None,
@@ -366,27 +397,62 @@ impl App {
 
     fn start_compose_new(&mut self) {
         self.compose_to.clear();
+        self.compose_cc.clear();
+        self.compose_bcc.clear();
         self.compose_subject.clear();
         self.compose_body.clear();
         self.compose_quote.clear();
         self.compose_focus = ComposeFocus::To;
         self.compose_cursor_to = 0;
+        self.compose_cursor_cc = 0;
+        self.compose_cursor_bcc = 0;
         self.compose_cursor_subject = 0;
         self.compose_cursor_body = 0;
         self.compose_body_desired_col = None;
         self.mode = Mode::Compose;
     }
 
-    fn start_compose_reply(&mut self) {
-        let (to, subject, quote) = build_reply(self.selected_detail());
+    fn start_compose_reply(&mut self, reply_all: bool) {
+        let raw = self.selected_message().and_then(|msg| {
+            self.runtime()
+                .block_on(async { self.store_handle.get_raw_body(msg.id).await.ok().flatten() })
+        });
+        let (to, cc, subject, quote) =
+            build_reply(self.selected_detail(), raw.as_deref(), &self.store.account.address, reply_all);
         self.compose_to = to;
+        self.compose_cc = cc;
+        self.compose_bcc.clear();
         self.compose_subject = subject;
         self.compose_body.clear();
         self.compose_quote = quote;
         self.compose_focus = ComposeFocus::Body;
         self.compose_cursor_to = text_char_len(&self.compose_to);
+        self.compose_cursor_cc = text_char_len(&self.compose_cc);
+        self.compose_cursor_bcc = 0;
         self.compose_cursor_subject = text_char_len(&self.compose_subject);
         self.compose_cursor_body = 0;
+        self.compose_body_desired_col = None;
+        self.mode = Mode::Compose;
+    }
+
+    fn start_compose_forward(&mut self) {
+        let raw = self.selected_message().and_then(|msg| {
+            self.runtime()
+                .block_on(async { self.store_handle.get_raw_body(msg.id).await.ok().flatten() })
+        });
+        let (subject, body) = build_forward(self.selected_detail(), raw.as_deref());
+        self.compose_to.clear();
+        self.compose_cc.clear();
+        self.compose_bcc.clear();
+        self.compose_subject = subject;
+        self.compose_body = body;
+        self.compose_quote.clear();
+        self.compose_focus = ComposeFocus::To;
+        self.compose_cursor_to = 0;
+        self.compose_cursor_cc = 0;
+        self.compose_cursor_bcc = 0;
+        self.compose_cursor_subject = text_char_len(&self.compose_subject);
+        self.compose_cursor_body = text_char_len(&self.compose_body);
         self.compose_body_desired_col = None;
         self.mode = Mode::Compose;
     }
@@ -776,11 +842,15 @@ impl App {
                     self.mode = Mode::List;
                     self.focus = Focus::Messages;
                     self.compose_to.clear();
+                    self.compose_cc.clear();
+                    self.compose_bcc.clear();
                     self.compose_subject.clear();
                     self.compose_body.clear();
                     self.compose_quote.clear();
                     self.compose_focus = ComposeFocus::Body;
                     self.compose_cursor_to = 0;
+                    self.compose_cursor_cc = 0;
+                    self.compose_cursor_bcc = 0;
                     self.compose_cursor_subject = 0;
                     self.compose_cursor_body = 0;
                     self.compose_body_desired_col = None;
@@ -1019,13 +1089,13 @@ impl App {
                 self.mode = Mode::OverlayAttach;
             }
             (KeyCode::Char('r'), _) => {
-                self.start_compose_reply();
+                self.start_compose_reply(false);
             }
             (KeyCode::Char('R'), _) => {
-                self.start_compose_reply();
+                self.start_compose_reply(true);
             }
             (KeyCode::Char('f'), _) => {
-                self.start_compose_reply();
+                self.start_compose_forward();
             }
             (KeyCode::Char('c'), _) => {
                 self.start_compose_new();
@@ -1095,13 +1165,13 @@ impl App {
                 self.mode = Mode::OverlayAttach;
             }
             (KeyCode::Char('r'), _) => {
-                self.start_compose_reply();
+                self.start_compose_reply(false);
             }
             (KeyCode::Char('R'), _) => {
-                self.start_compose_reply();
+                self.start_compose_reply(true);
             }
             (KeyCode::Char('f'), _) => {
-                self.start_compose_reply();
+                self.start_compose_forward();
             }
             (KeyCode::Esc, _) => {
                 self.mode = Mode::View;
@@ -1174,22 +1244,26 @@ impl App {
                     KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('\u{13}')
                 ))
         {
-                let to = self.compose_to.clone();
-                let subject = self.compose_subject.clone();
-                let mut body = self.compose_body.clone();
-                if !self.compose_quote.is_empty() {
-                    body.push_str(&self.compose_quote);
-                }
-                if to.trim().is_empty() {
-                    self.status_message = Some("No recipient".to_string());
-                } else {
-                    self.status_message = Some("Sending...".to_string());
-                    let _ = self.engine.send(MailCommand::SendMessage {
-                        to,
-                        subject,
-                        body,
-                    });
-                }
+            let to = self.compose_to.clone();
+            let cc = self.compose_cc.clone();
+            let bcc = self.compose_bcc.clone();
+            let subject = self.compose_subject.clone();
+            let mut body = self.compose_body.clone();
+            if !self.compose_quote.is_empty() {
+                body.push_str(&self.compose_quote);
+            }
+            if to.trim().is_empty() && cc.trim().is_empty() && bcc.trim().is_empty() {
+                self.status_message = Some("No recipient".to_string());
+            } else {
+                self.status_message = Some("Sending...".to_string());
+                let _ = self.engine.send(MailCommand::SendMessage {
+                    to,
+                    cc,
+                    bcc,
+                    subject,
+                    body,
+                });
+            }
             return false;
         }
         match (key.code, key.modifiers) {
@@ -1200,11 +1274,7 @@ impl App {
                 self.mode = Mode::View;
             }
             (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
-                self.compose_focus = match self.compose_focus {
-                    ComposeFocus::To => ComposeFocus::Body,
-                    ComposeFocus::Subject => ComposeFocus::To,
-                    ComposeFocus::Body => ComposeFocus::Subject,
-                };
+                self.compose_focus = compose_focus_prev(self.compose_focus);
                 self.compose_body_desired_col = None;
             }
             (KeyCode::Tab, _) | (KeyCode::Char('\t'), _) => {
@@ -1216,17 +1286,19 @@ impl App {
                     );
                     self.compose_body_desired_col = None;
                 } else {
-                    self.compose_focus = match self.compose_focus {
-                        ComposeFocus::To => ComposeFocus::Subject,
-                        ComposeFocus::Subject => ComposeFocus::Body,
-                        ComposeFocus::Body => ComposeFocus::To,
-                    };
+                    self.compose_focus = compose_focus_next(self.compose_focus);
                     self.compose_body_desired_col = None;
                 }
             }
             (KeyCode::Left, _) => match self.compose_focus {
                 ComposeFocus::To => {
                     move_cursor_left(&self.compose_to, &mut self.compose_cursor_to);
+                }
+                ComposeFocus::Cc => {
+                    move_cursor_left(&self.compose_cc, &mut self.compose_cursor_cc);
+                }
+                ComposeFocus::Bcc => {
+                    move_cursor_left(&self.compose_bcc, &mut self.compose_cursor_bcc);
                 }
                 ComposeFocus::Subject => {
                     move_cursor_left(&self.compose_subject, &mut self.compose_cursor_subject);
@@ -1239,6 +1311,12 @@ impl App {
             (KeyCode::Right, _) => match self.compose_focus {
                 ComposeFocus::To => {
                     move_cursor_right(&self.compose_to, &mut self.compose_cursor_to);
+                }
+                ComposeFocus::Cc => {
+                    move_cursor_right(&self.compose_cc, &mut self.compose_cursor_cc);
+                }
+                ComposeFocus::Bcc => {
+                    move_cursor_right(&self.compose_bcc, &mut self.compose_cursor_bcc);
                 }
                 ComposeFocus::Subject => {
                     move_cursor_right(&self.compose_subject, &mut self.compose_cursor_subject);
@@ -1270,8 +1348,12 @@ impl App {
             }
             (KeyCode::Enter, _) | (KeyCode::Char('\n'), _) | (KeyCode::Char('\r'), _) => {
                 match self.compose_focus {
-                    ComposeFocus::To => self.compose_focus = ComposeFocus::Subject,
-                    ComposeFocus::Subject => self.compose_focus = ComposeFocus::Body,
+                    ComposeFocus::To
+                    | ComposeFocus::Cc
+                    | ComposeFocus::Bcc
+                    | ComposeFocus::Subject => {
+                        self.compose_focus = compose_focus_next(self.compose_focus);
+                    }
                     ComposeFocus::Body => {
                         if apply_compose_key(
                             &mut self.compose_body,
@@ -1291,6 +1373,22 @@ impl App {
                         apply_compose_key(
                             &mut self.compose_to,
                             &mut self.compose_cursor_to,
+                            key,
+                            false,
+                        );
+                    }
+                    ComposeFocus::Cc => {
+                        apply_compose_key(
+                            &mut self.compose_cc,
+                            &mut self.compose_cursor_cc,
+                            key,
+                            false,
+                        );
+                    }
+                    ComposeFocus::Bcc => {
+                        apply_compose_key(
+                            &mut self.compose_bcc,
+                            &mut self.compose_cursor_bcc,
                             key,
                             false,
                         );
@@ -2420,6 +2518,7 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
@@ -2436,6 +2535,16 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
     } else {
         label_style
     };
+    let cc_label = if app.compose_focus == ComposeFocus::Cc {
+        Style::default().fg(Color::Yellow)
+    } else {
+        label_style
+    };
+    let bcc_label = if app.compose_focus == ComposeFocus::Bcc {
+        Style::default().fg(Color::Yellow)
+    } else {
+        label_style
+    };
     let to_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(6), Constraint::Min(1)])
@@ -2447,19 +2556,27 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(6), Constraint::Min(1)])
         .split(rows[1]);
-    frame.render_widget(Paragraph::new("Cc:").style(label_style), cc_layout[0]);
+    frame.render_widget(Paragraph::new("Cc:").style(cc_label), cc_layout[0]);
+    frame.render_widget(Paragraph::new(app.compose_cc.as_str()), cc_layout[1]);
+
+    let bcc_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(rows[2]);
+    frame.render_widget(Paragraph::new("Bcc:").style(bcc_label), bcc_layout[0]);
+    frame.render_widget(Paragraph::new(app.compose_bcc.as_str()), bcc_layout[1]);
 
     let subject_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(6), Constraint::Min(1)])
-        .split(rows[2]);
+        .split(rows[3]);
     frame.render_widget(Paragraph::new("Subj:").style(subject_label), subject_layout[0]);
     frame.render_widget(Paragraph::new(app.compose_subject.as_str()), subject_layout[1]);
 
-    let line = "─".repeat(rows[3].width as usize);
+    let line = "─".repeat(rows[4].width as usize);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(Color::DarkGray)),
-        rows[3],
+        rows[4],
     );
     let body_display = if app.compose_quote.is_empty() {
         app.compose_body.clone()
@@ -2468,7 +2585,7 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
         body.push_str(&app.compose_quote);
         body
     };
-    frame.render_widget(Paragraph::new(body_display), rows[4]);
+    frame.render_widget(Paragraph::new(body_display), rows[5]);
 
     let footer = if let Some(msg) = &app.status_message {
         format!(
@@ -2478,7 +2595,7 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
     } else {
         "Ctrl+S/F5 send   Tab next field   Shift+Tab prev field   Ctrl+Q cancel".to_string()
     };
-    frame.render_widget(Paragraph::new(footer), rows[5]);
+    frame.render_widget(Paragraph::new(footer), rows[6]);
 
     match app.compose_focus {
         ComposeFocus::To => set_cursor_at(
@@ -2486,6 +2603,18 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
             to_layout[1],
             &app.compose_to,
             app.compose_cursor_to,
+        ),
+        ComposeFocus::Cc => set_cursor_at(
+            frame,
+            cc_layout[1],
+            &app.compose_cc,
+            app.compose_cursor_cc,
+        ),
+        ComposeFocus::Bcc => set_cursor_at(
+            frame,
+            bcc_layout[1],
+            &app.compose_bcc,
+            app.compose_cursor_bcc,
         ),
         ComposeFocus::Subject => set_cursor_at(
             frame,
@@ -2495,7 +2624,7 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
         ),
         ComposeFocus::Body => set_cursor_at(
             frame,
-            rows[4],
+            rows[5],
             &app.compose_body,
             app.compose_cursor_body,
         ),
@@ -2619,11 +2748,16 @@ fn load_render_config() -> RenderConfig {
     }
 }
 
-fn build_reply(detail: Option<&MessageDetail>) -> (String, String, String) {
+fn build_reply(
+    detail: Option<&MessageDetail>,
+    raw: Option<&[u8]>,
+    account_addr: &str,
+    reply_all: bool,
+) -> (String, String, String, String) {
     let Some(detail) = detail else {
-        return (String::new(), "Re:".to_string(), String::new());
+        return (String::new(), String::new(), "Re:".to_string(), String::new());
     };
-    let to = extract_email(&detail.from);
+    let from_email = extract_email(&detail.from);
     let subject = if detail.subject.to_lowercase().starts_with("re:") {
         detail.subject.clone()
     } else {
@@ -2637,7 +2771,98 @@ fn build_reply(detail: Option<&MessageDetail>) -> (String, String, String) {
         body.push_str(line);
         body.push('\n');
     }
-    (to, subject, body)
+
+    let mut cc = String::new();
+    if reply_all {
+        if let Some(raw) = raw {
+            if let Ok(parsed) = mailparse::parse_mail(raw) {
+                let mut addrs = Vec::new();
+                addrs.extend(extract_header_addresses(&parsed, "To"));
+                addrs.extend(extract_header_addresses(&parsed, "Cc"));
+                let mut seen = HashSet::new();
+                let account = account_addr.trim().to_lowercase();
+                let sender = from_email.trim().to_lowercase();
+                let mut filtered = Vec::new();
+                for addr in addrs {
+                    let normalized = addr.to_lowercase();
+                    if normalized.is_empty()
+                        || normalized == account
+                        || normalized == sender
+                        || !seen.insert(normalized)
+                    {
+                        continue;
+                    }
+                    filtered.push(addr);
+                }
+                cc = filtered.join(", ");
+            }
+        }
+    }
+
+    (from_email, cc, subject, body)
+}
+
+fn build_forward(detail: Option<&MessageDetail>, raw: Option<&[u8]>) -> (String, String) {
+    let Some(detail) = detail else {
+        return ("Fwd:".to_string(), String::new());
+    };
+    let subject = if detail.subject.to_lowercase().starts_with("fwd:") {
+        detail.subject.clone()
+    } else {
+        format!("Fwd: {}", detail.subject)
+    };
+    let mut original_to = String::new();
+    if let Some(raw) = raw {
+        if let Ok(parsed) = mailparse::parse_mail(raw) {
+            let to_addrs = extract_header_addresses(&parsed, "To");
+            if !to_addrs.is_empty() {
+                original_to = to_addrs.join(", ");
+            }
+        }
+    }
+    let mut body = String::new();
+    body.push_str("\n\n---------- Forwarded message ---------\n");
+    body.push_str(&format!("From: {}\n", detail.from));
+    if !original_to.is_empty() {
+        body.push_str(&format!("To: {}\n", original_to));
+    }
+    body.push_str(&format!("Date: {}\n", detail.date));
+    body.push_str(&format!("Subject: {}\n\n", detail.subject));
+    body.push_str(&detail.body);
+    (subject, body)
+}
+
+fn extract_header_addresses(parsed: &mailparse::ParsedMail, name: &str) -> Vec<String> {
+    let Some(header) = parsed.headers.get_first_header(name) else {
+        return Vec::new();
+    };
+    match addrparse_header(&header) {
+        Ok(list) => mailaddrs_to_emails(&list),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn mailaddrs_to_emails(addrs: &[MailAddr]) -> Vec<String> {
+    let mut out = Vec::new();
+    for addr in addrs {
+        match addr {
+            MailAddr::Single(info) => {
+                let email = info.addr.trim();
+                if !email.is_empty() {
+                    out.push(email.to_string());
+                }
+            }
+            MailAddr::Group(group) => {
+                for info in &group.addrs {
+                    let email = info.addr.trim();
+                    if !email.is_empty() {
+                        out.push(email.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn extract_email(input: &str) -> String {
