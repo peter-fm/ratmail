@@ -243,48 +243,104 @@ impl SqliteMailStore {
         folder_id: i64,
         messages: &[MessageSummary],
     ) -> Result<()> {
-        let ids: Vec<i64> = sqlx::query_as::<_, (i64,)>(
-            "SELECT id FROM messages WHERE folder_id = ?",
+        let existing: Vec<(i64, Option<i64>)> = sqlx::query_as(
+            "SELECT id, imap_uid FROM messages WHERE folder_id = ?",
         )
         .bind(folder_id)
         .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|row| row.0)
-        .collect();
+        .await?;
 
-        if !ids.is_empty() {
-            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            for table in ["bodies", "cache_text", "cache_html", "cache_tiles"] {
-                let query = format!("DELETE FROM {} WHERE message_id IN ({})", table, placeholders);
+        let incoming_uids: Vec<i64> = messages
+            .iter()
+            .filter_map(|m| m.imap_uid.map(|v| v as i64))
+            .collect();
+
+        if !existing.is_empty() {
+            let mut to_delete = Vec::new();
+            for (id, uid) in existing {
+                if let Some(uid) = uid {
+                    if !incoming_uids.contains(&uid) {
+                        to_delete.push(id);
+                    }
+                } else {
+                    to_delete.push(id);
+                }
+            }
+
+            if !to_delete.is_empty() {
+                let placeholders = to_delete.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+                for table in ["bodies", "cache_text", "cache_html", "cache_tiles"] {
+                    let query = format!(
+                        "DELETE FROM {} WHERE message_id IN ({})",
+                        table, placeholders
+                    );
+                    let mut q = sqlx::query(&query);
+                    for id in &to_delete {
+                        q = q.bind(id);
+                    }
+                    q.execute(&self.pool).await?;
+                }
+                let query = format!(
+                    "DELETE FROM messages WHERE id IN ({})",
+                    placeholders
+                );
                 let mut q = sqlx::query(&query);
-                for id in &ids {
+                for id in &to_delete {
                     q = q.bind(id);
                 }
                 q.execute(&self.pool).await?;
             }
         }
 
-        sqlx::query("DELETE FROM messages WHERE folder_id = ?")
-            .bind(folder_id)
-            .execute(&self.pool)
-            .await?;
-
         for msg in messages {
-            sqlx::query(
-                "INSERT INTO messages (account_id, folder_id, imap_uid, date, from_addr, subject, unread, preview)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(account_id)
-            .bind(folder_id)
-            .bind(msg.imap_uid.map(|v| v as i64))
-            .bind(&msg.date)
-            .bind(&msg.from)
-            .bind(&msg.subject)
-            .bind(if msg.unread { 1 } else { 0 })
-            .bind(&msg.preview)
-            .execute(&self.pool)
-            .await?;
+            let uid = msg.imap_uid.map(|v| v as i64);
+
+            // Check if message exists by folder_id + imap_uid
+            // Note: ON CONFLICT doesn't work with partial unique indexes (migration 006)
+            let existing_id: Option<i64> = if let Some(uid_val) = uid {
+                sqlx::query_as::<_, (i64,)>(
+                    "SELECT id FROM messages WHERE folder_id = ? AND imap_uid = ?",
+                )
+                .bind(folder_id)
+                .bind(uid_val)
+                .fetch_optional(&self.pool)
+                .await?
+                .map(|r| r.0)
+            } else {
+                None
+            };
+
+            if let Some(existing_id) = existing_id {
+                // UPDATE existing message
+                sqlx::query(
+                    "UPDATE messages SET date = ?, from_addr = ?, subject = ?, unread = ?, preview = ?
+                     WHERE id = ?",
+                )
+                .bind(&msg.date)
+                .bind(&msg.from)
+                .bind(&msg.subject)
+                .bind(if msg.unread { 1 } else { 0 })
+                .bind(&msg.preview)
+                .bind(existing_id)
+                .execute(&self.pool)
+                .await?;
+            } else {
+                // INSERT new message
+                sqlx::query(
+                    "INSERT INTO messages (account_id, folder_id, imap_uid, date, from_addr, subject, unread, preview)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(account_id)
+                .bind(folder_id)
+                .bind(uid)
+                .bind(&msg.date)
+                .bind(&msg.from)
+                .bind(&msg.subject)
+                .bind(if msg.unread { 1 } else { 0 })
+                .bind(&msg.preview)
+                .execute(&self.pool)
+                .await?;
+            }
         }
         Ok(())
     }
@@ -295,6 +351,16 @@ impl SqliteMailStore {
         )
         .bind(account_id)
         .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub async fn first_folder_id(&self, account_id: i64) -> Result<Option<i64>> {
+        let row = sqlx::query_as::<_, (i64,)>(
+            "SELECT id FROM folders WHERE account_id = ? ORDER BY id LIMIT 1",
+        )
+        .bind(account_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.0))
@@ -499,15 +565,17 @@ Draft message...\r\n",
         &self,
         message_id: i64,
         width_px: i64,
+        tile_height_px: i64,
         theme: &str,
         remote_policy: &str,
     ) -> Result<()> {
         sqlx::query(
             "UPDATE cache_tiles SET updated_at = datetime('now')
-             WHERE message_id = ? AND width_px = ? AND theme = ? AND remote_policy = ?",
+             WHERE message_id = ? AND width_px = ? AND tile_height_px = ? AND theme = ? AND remote_policy = ?",
         )
         .bind(message_id)
         .bind(width_px)
+        .bind(tile_height_px)
         .bind(theme)
         .bind(remote_policy)
         .execute(&self.pool)
@@ -731,7 +799,7 @@ impl MailStore for SqliteMailStore {
         .await?;
 
         if !rows.is_empty() {
-            self.touch_cache_tiles(message_id, width_px, theme, remote_policy)
+            self.touch_cache_tiles(message_id, width_px, tile_height_px, theme, remote_policy)
                 .await?;
         }
 
@@ -756,18 +824,18 @@ impl MailStore for SqliteMailStore {
     ) -> Result<()> {
         for tile in tiles {
             sqlx::query(
-                "INSERT INTO cache_tiles (message_id, width_px, theme, remote_policy, tile_index, png_bytes, tile_height_px, updated_at)
+                "INSERT INTO cache_tiles (message_id, width_px, tile_height_px, theme, remote_policy, tile_index, png_bytes, updated_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                 ON CONFLICT(message_id, width_px, theme, remote_policy, tile_index)
-                 DO UPDATE SET png_bytes = excluded.png_bytes, tile_height_px = excluded.tile_height_px, updated_at = excluded.updated_at",
+                 ON CONFLICT(message_id, width_px, tile_height_px, theme, remote_policy, tile_index)
+                 DO UPDATE SET png_bytes = excluded.png_bytes, updated_at = excluded.updated_at",
             )
             .bind(message_id)
             .bind(width_px)
+            .bind(tile_height_px)
             .bind(theme)
             .bind(remote_policy)
             .bind(tile.tile_index)
             .bind(&tile.bytes)
-            .bind(tile_height_px)
             .execute(&self.pool)
             .await?;
         }

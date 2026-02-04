@@ -21,6 +21,7 @@ pub struct RenderRequest<'a> {
     pub message_id: i64,
     pub width_px: i64,
     pub tile_height_px: i64,
+    pub max_tiles: Option<usize>,
     pub theme: &'a str,
     pub remote_policy: RemotePolicy,
     pub prepared_html: &'a str,
@@ -32,6 +33,13 @@ pub struct RenderResult {
 }
 
 pub fn detect_image_support() -> bool {
+    if std::env::var("RATMAIL_FORCE_IMAGES")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
     let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
     let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
     let kitty = std::env::var("KITTY_WINDOW_ID").is_ok();
@@ -157,6 +165,7 @@ img{{max-width:100%; height:auto;}}\
             let tiles = slice_image_into_tiles(
                 img,
                 request.tile_height_px as u32,
+                request.max_tiles,
                 request.message_id,
             );
             if tiles.is_empty() {
@@ -172,13 +181,23 @@ img{{max-width:100%; height:auto;}}\
     }
 }
 
-fn slice_image_into_tiles(img: DynamicImage, tile_height: u32, _message_id: i64) -> Vec<TileMeta> {
+fn slice_image_into_tiles(
+    img: DynamicImage,
+    tile_height: u32,
+    max_tiles: Option<usize>,
+    _message_id: i64,
+) -> Vec<TileMeta> {
     let (width, height) = img.dimensions();
     let mut tiles = Vec::new();
     let mut y = 0;
     let mut index = 0;
 
     while y < height {
+        if let Some(limit) = max_tiles {
+            if tiles.len() >= limit {
+                break;
+            }
+        }
         let h = tile_height.min(height - y);
         let cropped = crop_imm(&img, 0, y, width, h).to_image();
         let mut png_bytes = Vec::new();
