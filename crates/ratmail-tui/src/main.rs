@@ -145,7 +145,7 @@ struct App {
     engine: MailEngine,
     events: tokio::sync::mpsc::UnboundedReceiver<MailEvent>,
     store_handle: SqliteMailStore,
-    runtime: tokio::runtime::Runtime,
+    runtime: Option<tokio::runtime::Runtime>,
     overlay_return: Mode,
     view_scroll: u16,
     render_supported: bool,
@@ -219,7 +219,7 @@ impl App {
             engine,
             events,
             store_handle,
-            runtime,
+            runtime: Some(runtime),
             overlay_return: Mode::View,
             view_scroll: 0,
             render_supported,
@@ -269,6 +269,19 @@ impl App {
             app.imap_status = Some("IMAP syncing...".to_string());
         }
         app
+    }
+
+    fn runtime(&self) -> &tokio::runtime::Runtime {
+        self.runtime
+            .as_ref()
+            .expect("runtime unavailable during app lifetime")
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(rt) = self.runtime.take() {
+            // Avoid hanging on long-running background tasks (e.g. IMAP sync).
+            rt.shutdown_timeout(Duration::from_millis(200));
+        }
     }
 
     fn selected_message(&self) -> Option<&MessageSummary> {
@@ -427,7 +440,7 @@ impl App {
         let theme = "default";
         let remote_policy = if self.allow_remote_images { "allowed" } else { "blocked" };
 
-        let cached = self.runtime.block_on(async move {
+        let cached = self.runtime().block_on(async move {
             store_handle
                 .get_cache_tiles(message_id, width_px, tile_height_px, theme, remote_policy)
                 .await
@@ -577,7 +590,7 @@ impl App {
 
         let message_id = message.id;
         let store_handle = self.store_handle.clone();
-        let result = self.runtime.block_on(async move {
+        let result = self.runtime().block_on(async move {
             if let Some(raw) = store_handle.get_raw_body(message_id).await? {
                 let display = extract_display(&raw, DEFAULT_TEXT_WIDTH as usize)?;
                 store_handle
@@ -621,7 +634,7 @@ impl App {
 
     fn ensure_raw_body_for_render(&mut self, message_id: i64) -> bool {
         let store_handle = self.store_handle.clone();
-        let has_raw = self.runtime.block_on(async move {
+        let has_raw = self.runtime().block_on(async move {
             store_handle.get_raw_body(message_id).await.ok().flatten().is_some()
         });
         if has_raw {
@@ -662,7 +675,7 @@ impl App {
                 continue;
             }
             let store_handle = self.store_handle.clone();
-            let has_raw = self.runtime.block_on(async move {
+            let has_raw = self.runtime().block_on(async move {
                 store_handle.get_raw_body(message_id).await.ok().flatten().is_some()
             });
             if has_raw {
@@ -688,7 +701,7 @@ impl App {
 
         let message_id = message.id;
         let store_handle = self.store_handle.clone();
-        let result = self.runtime.block_on(async move {
+        let result = self.runtime().block_on(async move {
             if let Some(raw) = store_handle.get_raw_body(message_id).await? {
                 let attachments = extract_attachments(&raw)?;
                 Ok::<_, anyhow::Error>(Some(attachments))
@@ -1642,6 +1655,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> R
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if app.on_key(key) {
+                    app.shutdown();
                     return Ok(());
                 }
             }
