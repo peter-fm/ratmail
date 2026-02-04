@@ -17,3 +17,5 @@ password = "app-password-or-imap-password"
 [render]
 remote_images = false
 width_px = 1000
+tile_height_px_side = 5000
+tile_height_px_focus = 120

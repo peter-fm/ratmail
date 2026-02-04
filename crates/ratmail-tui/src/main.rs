@@ -210,6 +210,8 @@ impl App {
         store_updates: tokio::sync::mpsc::UnboundedReceiver<StoreSnapshot>,
         allow_remote_images: bool,
         render_width_px: i64,
+        render_tile_height_px_side: i64,
+        render_tile_height_px_focus: i64,
         imap_enabled: bool,
     ) -> Self {
         let mut app = Self {
@@ -252,9 +254,9 @@ impl App {
             store_updates,
             allow_remote_images,
             render_width_px,
-            render_tile_height_px: 1200,
-            render_tile_height_px_focus: 120,
-            render_tile_height_px_side: 1200,
+            render_tile_height_px: render_tile_height_px_side,
+            render_tile_height_px_focus,
+            render_tile_height_px_side,
             link_index: 0,
             status_message: None,
             imap_enabled,
@@ -1680,6 +1682,14 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(render_config.width_px);
+    let render_tile_height_px_side = std::env::var("RATMAIL_RENDER_TILE_HEIGHT_PX_SIDE")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(render_config.tile_height_px_side);
+    let render_tile_height_px_focus = std::env::var("RATMAIL_RENDER_TILE_HEIGHT_PX_FOCUS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(render_config.tile_height_px_focus);
     let (engine, events, store_handle, store, store_update_tx, store_updates) = rt.block_on(async {
         let (engine, events) = MailEngine::start(smtp, imap.clone());
         let store_handle = SqliteMailStore::connect("ratmail.db").await?;
@@ -1886,6 +1896,8 @@ fn main() -> Result<()> {
             store_updates,
             allow_remote_images,
             render_width_px,
+            render_tile_height_px_side,
+            render_tile_height_px_focus,
             imap.is_some(),
         ),
     );
@@ -2541,6 +2553,8 @@ fn load_imap_config() -> Option<ImapConfig> {
 struct RenderConfig {
     allow_remote_images: bool,
     width_px: i64,
+    tile_height_px_side: i64,
+    tile_height_px_focus: i64,
 }
 
 fn load_render_config() -> RenderConfig {
@@ -2551,6 +2565,8 @@ fn load_render_config() -> RenderConfig {
             return RenderConfig {
                 allow_remote_images: false,
                 width_px: 1000,
+                tile_height_px_side: 5000,
+                tile_height_px_focus: 120,
             }
         }
     };
@@ -2560,6 +2576,8 @@ fn load_render_config() -> RenderConfig {
             return RenderConfig {
                 allow_remote_images: false,
                 width_px: 1000,
+                tile_height_px_side: 5000,
+                tile_height_px_focus: 120,
             }
         }
     };
@@ -2569,6 +2587,8 @@ fn load_render_config() -> RenderConfig {
             return RenderConfig {
                 allow_remote_images: false,
                 width_px: 1000,
+                tile_height_px_side: 5000,
+                tile_height_px_focus: 120,
             }
         }
     };
@@ -2583,9 +2603,19 @@ fn load_render_config() -> RenderConfig {
         Some(v) => v.as_integer().unwrap_or(1000) as i64,
         None => 1000,
     };
+    let tile_height_px_side = match render.get("tile_height_px_side") {
+        Some(v) => v.as_integer().unwrap_or(5000) as i64,
+        None => 5000,
+    };
+    let tile_height_px_focus = match render.get("tile_height_px_focus") {
+        Some(v) => v.as_integer().unwrap_or(120) as i64,
+        None => 120,
+    };
     RenderConfig {
         allow_remote_images,
         width_px,
+        tile_height_px_side,
+        tile_height_px_focus,
     }
 }
 
