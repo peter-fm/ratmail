@@ -27,7 +27,7 @@ use ratmail_content::{extract_attachments, extract_display, prepare_html};
 use ratmail_mail::{ImapConfig, MailCommand, MailEngine, MailEvent, SmtpConfig};
 use ratmail_render::{detect_image_support, ChromiumRenderer, NullRenderer, RemotePolicy, Renderer};
 use std::sync::Arc;
-use ratatui_image::{picker::Picker, protocol::Protocol, protocol::StatefulProtocol, Image, Resize, StatefulImage};
+use ratatui_image::{picker::Picker, protocol::ImageSource, protocol::Protocol, protocol::StatefulProtocol, Image, Resize, StatefulImage};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
 const PROTOCOL_CACHE_LIMIT: usize = 16;
@@ -162,6 +162,7 @@ struct App {
     protocol_cache: HashMap<(i64, usize), StatefulProtocol>,
     protocol_cache_lru: VecDeque<(i64, usize)>,
     protocol_cache_static: HashMap<(i64, usize), Protocol>,
+    tile_rows_cache: HashMap<(i64, usize), u16>,
     last_render_area: Option<(u16, u16)>,
     renderer_is_chromium: bool,
     render_error: Option<String>,
@@ -235,6 +236,7 @@ impl App {
             protocol_cache: HashMap::new(),
             protocol_cache_lru: VecDeque::new(),
             protocol_cache_static: HashMap::new(),
+            tile_rows_cache: HashMap::new(),
             last_render_area: None,
             renderer_is_chromium,
             render_error: None,
@@ -380,6 +382,13 @@ impl App {
         };
 
         self.render_tile_height_px = self.current_tile_height();
+        if let Some(picker) = self.image_picker.as_ref() {
+            let fh = picker.font_size().1 as i64;
+            if fh > 0 {
+                self.render_tile_height_px =
+                    ((self.render_tile_height_px + fh - 1) / fh) * fh;
+            }
+        }
 
         // Already have tiles for this message and tile height?
         if self.render_message_id == Some(message_id)
@@ -1912,6 +1921,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                 app.protocol_cache.clear();
                 app.protocol_cache_lru.clear();
                 app.protocol_cache_static.clear();
+                app.tile_rows_cache.clear();
                 app.last_render_area = Some(area_key);
                 app.image_protocol = None;
             }
@@ -1929,31 +1939,36 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                     .as_ref()
                     .map(|p| p.font_size())
                     .unwrap_or((10, 20));
-                let tile_rows = ((app.render_tile_height_px as f32) / (fh as f32))
-                    .ceil()
-                    .max(1.0) as u16;
+                let tile_rows = (app.render_tile_height_px / fh as i64)
+                    .max(1) as u16;
 
                 let mut y = content_area.y;
                 let end_y = content_area.y + content_area.height;
                 while y < end_y && idx < app.render_tiles.len() {
                     let remaining = end_y - y;
-                    let height = tile_rows.min(remaining);
-                    if height < tile_rows {
+                    let rect_height = tile_rows.min(remaining);
+                    if rect_height < tile_rows {
                         break; // avoid shrinking bottom tile
                     }
                     let rect = Rect {
                         x: content_area.x,
                         y,
                         width: content_area.width,
-                        height,
+                        height: rect_height,
                     };
 
                     if !app.protocol_cache_static.contains_key(&(message_id, idx)) {
                         if let Some(bytes) = app.render_tiles.get(idx).map(|t| t.bytes.clone()) {
                             if let Ok(img) = image::load_from_memory(&bytes) {
                                 if let Some(picker) = app.image_picker.as_mut() {
+                                    let source = ImageSource::new(
+                                        img.clone(),
+                                        picker.font_size(),
+                                        image::Rgba([0, 0, 0, 0]),
+                                    );
+                                    app.tile_rows_cache.insert((message_id, idx), source.desired.height);
                                     if let Ok(protocol) =
-                                        picker.new_protocol(img, rect, Resize::Fit(None))
+                                        picker.new_protocol(img, rect, Resize::Crop(None))
                                     {
                                         app.protocol_cache_static.insert((message_id, idx), protocol);
                                     }
@@ -1965,7 +1980,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                         frame.render_widget(Image::new(protocol), rect);
                     }
 
-                    y = y.saturating_add(height);
+                    y = y.saturating_add(tile_rows);
                     idx += 1;
                 }
             } else {
