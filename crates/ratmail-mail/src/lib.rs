@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use lettre::{
-    message::{Mailbox, Message},
+    message::{header::ContentType, Attachment, Mailbox, Message, MultiPart, SinglePart},
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
 };
@@ -29,6 +29,7 @@ pub enum MailCommand {
         bcc: String,
         subject: String,
         body: String,
+        attachments: Vec<OutgoingAttachment>,
     },
 }
 
@@ -79,6 +80,13 @@ pub struct ImapMessageSummary {
     pub subject: String,
     pub unread: bool,
     pub preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutgoingAttachment {
+    pub filename: String,
+    pub mime: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -145,9 +153,19 @@ impl MailEngine {
                         bcc,
                         subject,
                         body,
+                        attachments,
                     } => {
                         let _ = evt_tx.send(MailEvent::SendStarted);
-                        let result = send_smtp(smtp.clone(), &to, &cc, &bcc, &subject, &body).await;
+                        let result = send_smtp(
+                            smtp.clone(),
+                            &to,
+                            &cc,
+                            &bcc,
+                            &subject,
+                            &body,
+                            &attachments,
+                        )
+                        .await;
                         match result {
                             Ok(()) => {
                                 let _ = evt_tx.send(MailEvent::SendCompleted);
@@ -179,6 +197,7 @@ async fn send_smtp(
     bcc: &str,
     subject: &str,
     body: &str,
+    attachments: &[OutgoingAttachment],
 ) -> Result<()> {
     let smtp = smtp.ok_or_else(|| anyhow!("SMTP not configured"))?;
     let from_addr = parse_mailbox(&smtp.from)?;
@@ -199,7 +218,20 @@ async fn send_smtp(
     for addr in bcc_addrs {
         builder = builder.bcc(addr);
     }
-    let email = builder.body(body.to_string())?;
+    let email = if attachments.is_empty() {
+        builder.body(body.to_string())?
+    } else {
+        let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body.to_string()));
+        for attachment in attachments {
+            let mime = ContentType::parse(&attachment.mime)
+                .unwrap_or_else(|_| ContentType::parse("application/octet-stream").unwrap());
+            multipart = multipart.singlepart(
+                Attachment::new(attachment.filename.clone())
+                    .body(attachment.data.clone(), mime),
+            );
+        }
+        builder.multipart(multipart)?
+    };
 
     let creds = Credentials::new(smtp.username, smtp.password);
     let builder = if smtp.port == 465 {

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,12 +23,13 @@ use ratmail_core::{
     Folder, MailStore, MessageDetail, MessageSummary, SqliteMailStore, StoreSnapshot, TileMeta,
     DEFAULT_TEXT_WIDTH,
 };
-use ratmail_content::{extract_attachments, extract_display, prepare_html};
-use ratmail_mail::{ImapConfig, MailCommand, MailEngine, MailEvent, SmtpConfig};
+use ratmail_content::{extract_attachment_data, extract_attachments, extract_display, prepare_html};
+use ratmail_mail::{ImapConfig, MailCommand, MailEngine, MailEvent, OutgoingAttachment, SmtpConfig};
 use ratmail_render::{detect_image_support, ChromiumRenderer, NullRenderer, RemotePolicy, Renderer};
 use mailparse::{addrparse_header, MailAddr, MailHeaderMap};
 use std::sync::Arc;
 use ratatui_image::{picker::Picker, protocol::ImageSource, protocol::Protocol, protocol::StatefulProtocol, Image, Resize, StatefulImage};
+use mime_guess::MimeGuess;
 
 const TICK_RATE: Duration = Duration::from_millis(200);
 const PROTOCOL_CACHE_LIMIT: usize = 16;
@@ -113,6 +114,16 @@ enum Mode {
     Compose,
     OverlayLinks,
     OverlayAttach,
+}
+
+#[derive(Debug, Clone)]
+enum InputMode {
+    SaveAttachment {
+        message_id: i64,
+        attachment_index: usize,
+        filename: String,
+    },
+    AddComposeAttachment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +211,11 @@ struct App {
     render_tile_height_px_focus: i64,
     render_tile_height_px_side: i64,
     link_index: usize,
+    attach_index: usize,
     status_message: Option<String>,
+    input_mode: Option<InputMode>,
+    input_buffer: String,
+    input_cursor: usize,
     imap_enabled: bool,
     last_folder_sync: Option<(String, Instant)>,
     imap_pending: usize,
@@ -212,6 +227,7 @@ struct App {
     compose_subject: String,
     compose_body: String,
     compose_quote: String,
+    compose_attachments: Vec<ComposeAttachment>,
     compose_focus: ComposeFocus,
     compose_cursor_to: usize,
     compose_cursor_cc: usize,
@@ -219,6 +235,14 @@ struct App {
     compose_cursor_subject: usize,
     compose_cursor_body: usize,
     compose_body_desired_col: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct ComposeAttachment {
+    filename: String,
+    mime: String,
+    size: usize,
+    data: Vec<u8>,
 }
 
 impl App {
@@ -285,7 +309,11 @@ impl App {
             render_tile_height_px_focus,
             render_tile_height_px_side,
             link_index: 0,
+            attach_index: 0,
             status_message: None,
+            input_mode: None,
+            input_buffer: String::new(),
+            input_cursor: 0,
             imap_enabled,
             last_folder_sync: None,
             imap_pending: 0,
@@ -297,6 +325,7 @@ impl App {
             compose_subject: String::new(),
             compose_body: String::new(),
             compose_quote: String::new(),
+            compose_attachments: Vec::new(),
             compose_focus: ComposeFocus::Body,
             compose_cursor_to: 0,
             compose_cursor_cc: 0,
@@ -387,6 +416,9 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        if self.input_mode.is_some() {
+            return self.on_key_input(key);
+        }
         match self.mode {
             Mode::List | Mode::View => self.on_key_main(key),
             Mode::ViewFocus => self.on_key_focus(key),
@@ -402,6 +434,7 @@ impl App {
         self.compose_subject.clear();
         self.compose_body.clear();
         self.compose_quote.clear();
+        self.compose_attachments.clear();
         self.compose_focus = ComposeFocus::To;
         self.compose_cursor_to = 0;
         self.compose_cursor_cc = 0;
@@ -425,6 +458,7 @@ impl App {
         self.compose_subject = subject;
         self.compose_body.clear();
         self.compose_quote = quote;
+        self.compose_attachments.clear();
         self.compose_focus = ComposeFocus::Body;
         self.compose_cursor_to = text_char_len(&self.compose_to);
         self.compose_cursor_cc = text_char_len(&self.compose_cc);
@@ -447,6 +481,7 @@ impl App {
         self.compose_subject = subject;
         self.compose_body = body;
         self.compose_quote.clear();
+        self.compose_attachments.clear();
         self.compose_focus = ComposeFocus::To;
         self.compose_cursor_to = 0;
         self.compose_cursor_cc = 0;
@@ -847,6 +882,7 @@ impl App {
                     self.compose_subject.clear();
                     self.compose_body.clear();
                     self.compose_quote.clear();
+                    self.compose_attachments.clear();
                     self.compose_focus = ComposeFocus::Body;
                     self.compose_cursor_to = 0;
                     self.compose_cursor_cc = 0;
@@ -1085,6 +1121,7 @@ impl App {
             }
             (KeyCode::Char('a'), _) => {
                 self.ensure_attachments_for_selected();
+                self.attach_index = 0;
                 self.overlay_return = self.mode;
                 self.mode = Mode::OverlayAttach;
             }
@@ -1161,6 +1198,7 @@ impl App {
             }
             (KeyCode::Char('a'), _) => {
                 self.ensure_attachments_for_selected();
+                self.attach_index = 0;
                 self.overlay_return = self.mode;
                 self.mode = Mode::OverlayAttach;
             }
@@ -1228,6 +1266,26 @@ impl App {
                     self.mode = self.overlay_return;
                 }
                 KeyCode::Char('q') => return true,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let count = self
+                        .selected_detail()
+                        .map(|d| d.attachments.len())
+                        .unwrap_or(0);
+                    if self.attach_index + 1 < count {
+                        self.attach_index += 1;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if self.attach_index > 0 {
+                        self.attach_index -= 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.open_selected_attachment();
+                }
+                KeyCode::Char('s') => {
+                    self.prompt_save_selected_attachment();
+                }
                 _ => {}
             },
             _ => {}
@@ -1237,6 +1295,21 @@ impl App {
 
     fn on_key_compose(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A')) {
+            self.start_input(InputMode::AddComposeAttachment, String::new());
+            return false;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
+            if self.compose_attachments.is_empty() {
+                self.status_message = Some("No attachments to remove".to_string());
+            } else {
+                let removed = self.compose_attachments.pop();
+                if let Some(removed) = removed {
+                    self.status_message = Some(format!("Removed attachment {}", removed.filename));
+                }
+            }
+            return false;
+        }
         if matches!(key.code, KeyCode::F(5))
             || (ctrl
                 && matches!(
@@ -1252,6 +1325,15 @@ impl App {
             if !self.compose_quote.is_empty() {
                 body.push_str(&self.compose_quote);
             }
+            let attachments: Vec<OutgoingAttachment> = self
+                .compose_attachments
+                .iter()
+                .map(|a| OutgoingAttachment {
+                    filename: a.filename.clone(),
+                    mime: a.mime.clone(),
+                    data: a.data.clone(),
+                })
+                .collect();
             if to.trim().is_empty() && cc.trim().is_empty() && bcc.trim().is_empty() {
                 self.status_message = Some("No recipient".to_string());
             } else {
@@ -1262,6 +1344,7 @@ impl App {
                     bcc,
                     subject,
                     body,
+                    attachments,
                 });
             }
             return false;
@@ -1416,6 +1499,216 @@ impl App {
         }
         false
     }
+
+    fn on_key_input(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = None;
+                self.input_buffer.clear();
+                self.input_cursor = 0;
+                self.status_message = Some("Canceled".to_string());
+            }
+            KeyCode::Enter => {
+                self.submit_input();
+            }
+            KeyCode::Left => move_cursor_left(&self.input_buffer, &mut self.input_cursor),
+            KeyCode::Right => move_cursor_right(&self.input_buffer, &mut self.input_cursor),
+            _ => {
+                apply_input_key(&mut self.input_buffer, &mut self.input_cursor, key);
+            }
+        }
+        false
+    }
+
+    fn start_input(&mut self, mode: InputMode, initial: String) {
+        self.input_mode = Some(mode);
+        self.input_buffer = initial;
+        self.input_cursor = text_char_len(&self.input_buffer);
+    }
+
+    fn submit_input(&mut self) {
+        let mode = self.input_mode.clone();
+        self.input_mode = None;
+        let buffer = self.input_buffer.trim().to_string();
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+
+        match mode {
+            Some(InputMode::AddComposeAttachment) => {
+                if buffer.is_empty() {
+                    self.status_message = Some("Attachment path required".to_string());
+                    return;
+                }
+                let path = expand_tilde(&buffer);
+                match self.add_compose_attachment_from_path(Path::new(&path)) {
+                    Ok(added) => {
+                        self.status_message = Some(format!(
+                            "Attached {} ({})",
+                            added.filename,
+                            format_size(added.size)
+                        ));
+                    }
+                    Err(err) => {
+                        self.status_message = Some(format!("Attach failed: {}", err));
+                    }
+                }
+            }
+            Some(InputMode::SaveAttachment {
+                message_id,
+                attachment_index,
+                filename,
+            }) => {
+                let target = if buffer.is_empty() { filename } else { buffer };
+                let path = expand_tilde(&target);
+                match self.save_attachment_to_path(message_id, attachment_index, Path::new(&path)) {
+                    Ok(path) => {
+                        self.status_message = Some(format!(
+                            "Saved attachment to {}",
+                            path.display()
+                        ));
+                    }
+                    Err(err) => {
+                        if err.to_string() != "message body not cached" {
+                            self.status_message = Some(format!("Save failed: {}", err));
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn open_selected_attachment(&mut self) {
+        let Some(detail) = self.selected_detail() else { return };
+        if detail.attachments.is_empty() || self.attach_index >= detail.attachments.len() {
+            return;
+        }
+        let message_id = detail.id;
+        let filename = detail.attachments[self.attach_index].filename.clone();
+        match self.save_attachment_to_temp(message_id, self.attach_index, &filename) {
+            Ok(path) => {
+                let _ = open::that(&path);
+                self.status_message = Some(format!("Opened {}", path.display()));
+            }
+            Err(err) => {
+                if err.to_string() != "message body not cached" {
+                    self.status_message = Some(format!("Open failed: {}", err));
+                }
+            }
+        }
+    }
+
+    fn prompt_save_selected_attachment(&mut self) {
+        let Some(detail) = self.selected_detail() else { return };
+        if detail.attachments.is_empty() || self.attach_index >= detail.attachments.len() {
+            return;
+        }
+        let filename = detail.attachments[self.attach_index].filename.clone();
+        let message_id = detail.id;
+        self.start_input(
+            InputMode::SaveAttachment {
+                message_id,
+                attachment_index: self.attach_index,
+                filename: filename.clone(),
+            },
+            filename,
+        );
+    }
+
+    fn add_compose_attachment_from_path(&mut self, path: &Path) -> Result<ComposeAttachment> {
+        if !path.exists() {
+            return Err(anyhow::anyhow!("file not found"));
+        }
+        let filename = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let data = std::fs::read(path)?;
+        let size = data.len();
+        let mime = MimeGuess::from_path(path)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string();
+        let attachment = ComposeAttachment {
+            filename,
+            mime,
+            size,
+            data,
+        };
+        self.compose_attachments.push(attachment.clone());
+        Ok(attachment)
+    }
+
+    fn save_attachment_to_temp(
+        &mut self,
+        message_id: i64,
+        attachment_index: usize,
+        filename: &str,
+    ) -> Result<PathBuf> {
+        let safe = safe_filename(filename);
+        let temp_name = format!(
+            "ratmail-{}-{}-{}",
+            message_id,
+            attachment_index + 1,
+            safe
+        );
+        let path = std::env::temp_dir().join(temp_name);
+        self.save_attachment_to_path(message_id, attachment_index, &path)
+    }
+
+    fn save_attachment_to_path(
+        &mut self,
+        message_id: i64,
+        attachment_index: usize,
+        path: &Path,
+    ) -> Result<PathBuf> {
+        let raw = self.get_raw_body_or_fetch(message_id)?;
+        let data = extract_attachment_data(&raw, attachment_index)?
+            .ok_or_else(|| anyhow::anyhow!("attachment not found"))?;
+
+        let mut target = PathBuf::from(path);
+        if target.is_dir() {
+            target = target.join(safe_filename(&data.filename));
+        }
+        if let Some(parent) = target.parent() {
+            if !parent.exists() {
+                return Err(anyhow::anyhow!("parent directory does not exist"));
+            }
+        }
+        std::fs::write(&target, &data.data)?;
+        Ok(target)
+    }
+
+    fn get_raw_body_or_fetch(&mut self, message_id: i64) -> Result<Vec<u8>> {
+        let raw = self
+            .runtime()
+            .block_on(async { self.store_handle.get_raw_body(message_id).await.ok().flatten() });
+        if let Some(raw) = raw {
+            return Ok(raw);
+        }
+        if self.imap_enabled {
+            let (uid, folder_name) = self.message_location(message_id);
+            if let (Some(uid), Some(folder_name)) = (uid, folder_name) {
+                let _ = self.engine.send(MailCommand::FetchMessageBody {
+                    message_id,
+                    folder_name,
+                    uid,
+                });
+                self.status_message = Some("Fetching body...".to_string());
+            }
+        }
+        Err(anyhow::anyhow!("message body not cached"))
+    }
+
+    fn message_location(&self, message_id: i64) -> (Option<u32>, Option<String>) {
+        let message = self.store.messages.iter().find(|m| m.id == message_id);
+        let uid = message.and_then(|m| m.imap_uid);
+        let folder_name = message
+            .and_then(|m| self.store.folders.iter().find(|f| f.id == m.folder_id))
+            .map(|f| f.name.clone());
+        (uid, folder_name)
+    }
 }
 
 fn apply_compose_key(
@@ -1455,6 +1748,37 @@ fn apply_compose_key(
                 *cursor += 1;
                 return true;
             }
+        }
+        _ => {}
+    }
+    *cursor = clamp_cursor(*cursor, target);
+    false
+}
+
+fn apply_input_key(target: &mut String, cursor: &mut usize, key: KeyEvent) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Backspace => {
+            if *cursor > 0 {
+                remove_char_at(target, *cursor - 1);
+                *cursor -= 1;
+                return true;
+            }
+        }
+        KeyCode::Delete => {
+            let len = text_char_len(target);
+            if *cursor < len {
+                remove_char_at(target, *cursor);
+                return true;
+            }
+        }
+        KeyCode::Char(c) => {
+            let idx = char_to_byte_idx(target, *cursor);
+            target.insert_str(idx, c.encode_utf8(&mut [0; 4]));
+            *cursor += 1;
+            return true;
         }
         _ => {}
     }
@@ -2061,6 +2385,10 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         Mode::ViewFocus => render_view_focus(frame, area, app),
         _ => {}
     }
+
+    if app.input_mode.is_some() {
+        render_input_overlay(frame, area, app);
+    }
 }
 
 fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -2472,8 +2800,10 @@ fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) 
         } else {
             for (idx, attachment) in detail.attachments.iter().enumerate() {
                 let size = format_size(attachment.size);
+                let marker = if idx == app.attach_index { ">" } else { " " };
                 lines.push(Line::from(format!(
-                    "  {:>2}  {:<24} {:>7}  {}",
+                    "{} {:>2}  {:<24} {:>7}  {}",
+                    marker,
                     idx + 1,
                     attachment.filename,
                     size,
@@ -2486,11 +2816,35 @@ fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) 
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from("Enter open  s save  y copy name  Esc close"));
+    lines.push(Line::from("j/k move  Enter open  s save  Esc close"));
 
     let block = Block::default().borders(Borders::ALL).title("ATTACHMENTS");
     let paragraph = Paragraph::new(Text::from(lines)).block(block).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup);
+}
+
+fn render_input_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Some(mode) = &app.input_mode else { return };
+    let popup = centered_rect(70, 20, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title("INPUT");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let prompt = match mode {
+        InputMode::SaveAttachment { .. } => "Save attachment as: ",
+        InputMode::AddComposeAttachment => "Attach file path: ",
+    };
+    let line = format!("{}{}", prompt, app.input_buffer);
+    let help = "Enter confirm  Esc cancel";
+    let text = Text::from(vec![Line::from(line), Line::from(""), Line::from(help)]);
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+
+    let prompt_len = prompt.chars().count() as u16;
+    let cursor_col = prompt_len.saturating_add(app.input_cursor as u16);
+    let x = inner.x + cursor_col.min(inner.width.saturating_sub(1));
+    let y = inner.y;
+    frame.set_cursor_position((x, y));
 }
 
 fn format_size(bytes: usize) -> String {
@@ -2501,6 +2855,23 @@ fn format_size(bytes: usize) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+fn expand_tilde(input: &str) -> String {
+    if let Some(rest) = input.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return Path::new(&home).join(rest).to_string_lossy().to_string();
+        }
+    }
+    input.to_string()
+}
+
+fn safe_filename(input: &str) -> String {
+    Path::new(input)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment")
+        .to_string()
 }
 
 fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
@@ -2514,6 +2885,7 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -2573,10 +2945,26 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
     frame.render_widget(Paragraph::new("Subj:").style(subject_label), subject_layout[0]);
     frame.render_widget(Paragraph::new(app.compose_subject.as_str()), subject_layout[1]);
 
-    let line = "─".repeat(rows[4].width as usize);
+    let attachment_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(rows[4]);
+    let attachment_text = if app.compose_attachments.is_empty() {
+        "(no attachments)".to_string()
+    } else {
+        app.compose_attachments
+            .iter()
+            .map(|a| format!("{} ({})", a.filename, format_size(a.size)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    frame.render_widget(Paragraph::new("Att:").style(label_style), attachment_layout[0]);
+    frame.render_widget(Paragraph::new(attachment_text), attachment_layout[1]);
+
+    let line = "─".repeat(rows[5].width as usize);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().fg(Color::DarkGray)),
-        rows[4],
+        rows[5],
     );
     let body_display = if app.compose_quote.is_empty() {
         app.compose_body.clone()
@@ -2585,17 +2973,18 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
         body.push_str(&app.compose_quote);
         body
     };
-    frame.render_widget(Paragraph::new(body_display), rows[5]);
+    frame.render_widget(Paragraph::new(body_display), rows[6]);
 
     let footer = if let Some(msg) = &app.status_message {
         format!(
-            "Ctrl+S/F5 send   Tab next field   Shift+Tab prev field   Ctrl+Q cancel   | {}",
+            "Ctrl+S/F5 send   Ctrl+A attach   Ctrl+R remove last   Tab next   Shift+Tab prev   Ctrl+Q cancel   | {}",
             msg
         )
     } else {
-        "Ctrl+S/F5 send   Tab next field   Shift+Tab prev field   Ctrl+Q cancel".to_string()
+        "Ctrl+S/F5 send   Ctrl+A attach   Ctrl+R remove last   Tab next   Shift+Tab prev   Ctrl+Q cancel"
+            .to_string()
     };
-    frame.render_widget(Paragraph::new(footer), rows[6]);
+    frame.render_widget(Paragraph::new(footer), rows[7]);
 
     match app.compose_focus {
         ComposeFocus::To => set_cursor_at(
@@ -2624,7 +3013,7 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
         ),
         ComposeFocus::Body => set_cursor_at(
             frame,
-            rows[5],
+            rows[6],
             &app.compose_body,
             app.compose_cursor_body,
         ),

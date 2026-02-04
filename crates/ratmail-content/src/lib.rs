@@ -20,6 +20,13 @@ pub struct PreparedHtml {
     pub blocked_remote: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct AttachmentData {
+    pub filename: String,
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
 pub fn extract_display(raw: &[u8], width_cols: usize) -> Result<DisplayText> {
     let parsed = mailparse::parse_mail(raw)?;
     let (body, is_html) = select_body(&parsed)?;
@@ -42,6 +49,12 @@ pub fn extract_attachments(raw: &[u8]) -> Result<Vec<AttachmentMeta>> {
     let mut attachments = Vec::new();
     collect_attachments(&parsed, &mut attachments)?;
     Ok(attachments)
+}
+
+pub fn extract_attachment_data(raw: &[u8], index: usize) -> Result<Option<AttachmentData>> {
+    let parsed = mailparse::parse_mail(raw)?;
+    let mut current = 0usize;
+    collect_attachment_at(&parsed, index, &mut current)
 }
 
 pub fn prepare_html(raw: &[u8], allow_remote: bool) -> Result<Option<PreparedHtml>> {
@@ -140,6 +153,48 @@ fn collect_attachments(parsed: &ParsedMail, out: &mut Vec<AttachmentMeta>) -> Re
         collect_attachments(part, out)?;
     }
     Ok(())
+}
+
+fn collect_attachment_at(
+    parsed: &ParsedMail,
+    target_index: usize,
+    current: &mut usize,
+) -> Result<Option<AttachmentData>> {
+    if parsed.subparts.is_empty() {
+        let ctype = parsed.ctype.mimetype.to_lowercase();
+        let disposition = parsed.get_content_disposition();
+        let mut filename = disposition
+            .params
+            .get("filename")
+            .cloned()
+            .or_else(|| parsed.ctype.params.get("name").cloned());
+
+        let is_attachment = matches!(
+            disposition.disposition,
+            mailparse::DispositionType::Attachment
+        ) || filename.is_some();
+
+        if is_attachment {
+            if *current == target_index {
+                let body = parsed.get_body_raw()?;
+                let name = filename.take().unwrap_or_else(|| "attachment".to_string());
+                return Ok(Some(AttachmentData {
+                    filename: name,
+                    mime: ctype,
+                    data: body,
+                }));
+            }
+            *current += 1;
+        }
+        return Ok(None);
+    }
+
+    for part in &parsed.subparts {
+        if let Some(found) = collect_attachment_at(part, target_index, current)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 fn find_html_part(parsed: &ParsedMail) -> Result<Option<String>> {

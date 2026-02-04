@@ -19,6 +19,7 @@ image.workspace = true
 open.workspace = true
 toml.workspace = true
 mailparse.workspace = true
+mime_guess.workspace = true
 
 [[bin]]
 name = "ratmail"
