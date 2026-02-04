@@ -186,7 +186,12 @@ struct App {
     compose_to: String,
     compose_subject: String,
     compose_body: String,
+    compose_quote: String,
     compose_focus: ComposeFocus,
+    compose_cursor_to: usize,
+    compose_cursor_subject: usize,
+    compose_cursor_body: usize,
+    compose_body_desired_col: Option<usize>,
 }
 
 impl App {
@@ -260,7 +265,12 @@ impl App {
             compose_to: String::new(),
             compose_subject: String::new(),
             compose_body: String::new(),
+            compose_quote: String::new(),
             compose_focus: ComposeFocus::Body,
+            compose_cursor_to: 0,
+            compose_cursor_subject: 0,
+            compose_cursor_body: 0,
+            compose_body_desired_col: None,
         };
         app.select_inbox_if_available();
         if app.imap_enabled {
@@ -356,16 +366,26 @@ impl App {
         self.compose_to.clear();
         self.compose_subject.clear();
         self.compose_body.clear();
+        self.compose_quote.clear();
         self.compose_focus = ComposeFocus::To;
+        self.compose_cursor_to = 0;
+        self.compose_cursor_subject = 0;
+        self.compose_cursor_body = 0;
+        self.compose_body_desired_col = None;
         self.mode = Mode::Compose;
     }
 
     fn start_compose_reply(&mut self) {
-        let (to, subject, body) = build_reply(self.selected_detail());
+        let (to, subject, quote) = build_reply(self.selected_detail());
         self.compose_to = to;
         self.compose_subject = subject;
-        self.compose_body = body;
+        self.compose_body.clear();
+        self.compose_quote = quote;
         self.compose_focus = ComposeFocus::Body;
+        self.compose_cursor_to = text_char_len(&self.compose_to);
+        self.compose_cursor_subject = text_char_len(&self.compose_subject);
+        self.compose_cursor_body = 0;
+        self.compose_body_desired_col = None;
         self.mode = Mode::Compose;
     }
 
@@ -750,6 +770,19 @@ impl App {
             }
             MailEvent::SendCompleted => {
                 self.status_message = Some("Sent".to_string());
+                if self.mode == Mode::Compose {
+                    self.mode = Mode::List;
+                    self.focus = Focus::Messages;
+                    self.compose_to.clear();
+                    self.compose_subject.clear();
+                    self.compose_body.clear();
+                    self.compose_quote.clear();
+                    self.compose_focus = ComposeFocus::Body;
+                    self.compose_cursor_to = 0;
+                    self.compose_cursor_subject = 0;
+                    self.compose_cursor_body = 0;
+                    self.compose_body_desired_col = None;
+                }
             }
             MailEvent::SendFailed { reason } => {
                 self.status_message = Some(format!("Send failed: {}", reason));
@@ -1141,7 +1174,10 @@ impl App {
         {
                 let to = self.compose_to.clone();
                 let subject = self.compose_subject.clone();
-                let body = self.compose_body.clone();
+                let mut body = self.compose_body.clone();
+                if !self.compose_quote.is_empty() {
+                    body.push_str(&self.compose_quote);
+                }
                 if to.trim().is_empty() {
                     self.status_message = Some("No recipient".to_string());
                 } else {
@@ -1161,32 +1197,119 @@ impl App {
             (KeyCode::Esc, _) => {
                 self.mode = Mode::View;
             }
-            (KeyCode::Tab, _) | (KeyCode::Char('\t'), _) => {
+            (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
                 self.compose_focus = match self.compose_focus {
-                    ComposeFocus::To => ComposeFocus::Subject,
-                    ComposeFocus::Subject => ComposeFocus::Body,
-                    ComposeFocus::Body => ComposeFocus::To,
+                    ComposeFocus::To => ComposeFocus::Body,
+                    ComposeFocus::Subject => ComposeFocus::To,
+                    ComposeFocus::Body => ComposeFocus::Subject,
                 };
+                self.compose_body_desired_col = None;
+            }
+            (KeyCode::Tab, _) | (KeyCode::Char('\t'), _) => {
+                if self.compose_focus == ComposeFocus::Body {
+                    insert_text_at_cursor(
+                        &mut self.compose_body,
+                        &mut self.compose_cursor_body,
+                        "    ",
+                    );
+                    self.compose_body_desired_col = None;
+                } else {
+                    self.compose_focus = match self.compose_focus {
+                        ComposeFocus::To => ComposeFocus::Subject,
+                        ComposeFocus::Subject => ComposeFocus::Body,
+                        ComposeFocus::Body => ComposeFocus::To,
+                    };
+                    self.compose_body_desired_col = None;
+                }
+            }
+            (KeyCode::Left, _) => match self.compose_focus {
+                ComposeFocus::To => {
+                    move_cursor_left(&self.compose_to, &mut self.compose_cursor_to);
+                }
+                ComposeFocus::Subject => {
+                    move_cursor_left(&self.compose_subject, &mut self.compose_cursor_subject);
+                }
+                ComposeFocus::Body => {
+                    move_cursor_left(&self.compose_body, &mut self.compose_cursor_body);
+                    self.compose_body_desired_col = None;
+                }
+            },
+            (KeyCode::Right, _) => match self.compose_focus {
+                ComposeFocus::To => {
+                    move_cursor_right(&self.compose_to, &mut self.compose_cursor_to);
+                }
+                ComposeFocus::Subject => {
+                    move_cursor_right(&self.compose_subject, &mut self.compose_cursor_subject);
+                }
+                ComposeFocus::Body => {
+                    move_cursor_right(&self.compose_body, &mut self.compose_cursor_body);
+                    self.compose_body_desired_col = None;
+                }
+            },
+            (KeyCode::Up, _) => {
+                if self.compose_focus == ComposeFocus::Body {
+                    self.compose_cursor_body = move_cursor_vertical(
+                        &self.compose_body,
+                        self.compose_cursor_body,
+                        DirectionKey::Up,
+                        &mut self.compose_body_desired_col,
+                    );
+                }
+            }
+            (KeyCode::Down, _) => {
+                if self.compose_focus == ComposeFocus::Body {
+                    self.compose_cursor_body = move_cursor_vertical(
+                        &self.compose_body,
+                        self.compose_cursor_body,
+                        DirectionKey::Down,
+                        &mut self.compose_body_desired_col,
+                    );
+                }
             }
             (KeyCode::Enter, _) | (KeyCode::Char('\n'), _) | (KeyCode::Char('\r'), _) => {
                 match self.compose_focus {
                     ComposeFocus::To => self.compose_focus = ComposeFocus::Subject,
                     ComposeFocus::Subject => self.compose_focus = ComposeFocus::Body,
                     ComposeFocus::Body => {
-                        self.compose_body.push('\n');
+                        if apply_compose_key(
+                            &mut self.compose_body,
+                            &mut self.compose_cursor_body,
+                            key,
+                            true,
+                        ) {
+                            self.compose_body_desired_col = None;
+                        }
                     }
                 }
+                self.compose_body_desired_col = None;
             }
             _ => {
                 match self.compose_focus {
                     ComposeFocus::To => {
-                        apply_compose_key(&mut self.compose_to, key, false);
+                        apply_compose_key(
+                            &mut self.compose_to,
+                            &mut self.compose_cursor_to,
+                            key,
+                            false,
+                        );
                     }
                     ComposeFocus::Subject => {
-                        apply_compose_key(&mut self.compose_subject, key, false);
+                        apply_compose_key(
+                            &mut self.compose_subject,
+                            &mut self.compose_cursor_subject,
+                            key,
+                            false,
+                        );
                     }
                     ComposeFocus::Body => {
-                        apply_compose_key(&mut self.compose_body, key, true);
+                        if apply_compose_key(
+                            &mut self.compose_body,
+                            &mut self.compose_cursor_body,
+                            key,
+                            true,
+                        ) {
+                            self.compose_body_desired_col = None;
+                        }
                     }
                 }
             }
@@ -1195,24 +1318,162 @@ impl App {
     }
 }
 
-fn apply_compose_key(target: &mut String, key: KeyEvent, allow_newline: bool) {
+fn apply_compose_key(
+    target: &mut String,
+    cursor: &mut usize,
+    key: KeyEvent,
+    allow_newline: bool,
+) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
-        return;
+        return false;
     }
     match key.code {
         KeyCode::Backspace => {
-            target.pop();
+            if *cursor > 0 {
+                remove_char_at(target, *cursor - 1);
+                *cursor -= 1;
+                return true;
+            }
+        }
+        KeyCode::Delete => {
+            let len = text_char_len(target);
+            if *cursor < len {
+                remove_char_at(target, *cursor);
+                return true;
+            }
         }
         KeyCode::Char(c) => {
-            target.push(c);
+            let idx = char_to_byte_idx(target, *cursor);
+            target.insert_str(idx, c.encode_utf8(&mut [0; 4]));
+            *cursor += 1;
+            return true;
         }
         KeyCode::Enter => {
             if allow_newline {
-                target.push('\n');
+                let idx = char_to_byte_idx(target, *cursor);
+                target.insert(idx, '\n');
+                *cursor += 1;
+                return true;
             }
         }
         _ => {}
     }
+    *cursor = clamp_cursor(*cursor, target);
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectionKey {
+    Up,
+    Down,
+}
+
+fn text_char_len(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn clamp_cursor(cursor: usize, text: &str) -> usize {
+    cursor.min(text_char_len(text))
+}
+
+fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    let mut count = 0usize;
+    for (byte_idx, _) in text.char_indices() {
+        if count == char_idx {
+            return byte_idx;
+        }
+        count += 1;
+    }
+    text.len()
+}
+
+fn remove_char_at(text: &mut String, char_idx: usize) {
+    let start = char_to_byte_idx(text, char_idx);
+    let end = char_to_byte_idx(text, char_idx + 1);
+    if start < end {
+        text.replace_range(start..end, "");
+    }
+}
+
+fn insert_text_at_cursor(text: &mut String, cursor: &mut usize, insert: &str) {
+    if insert.is_empty() {
+        return;
+    }
+    let idx = char_to_byte_idx(text, *cursor);
+    text.insert_str(idx, insert);
+    *cursor += insert.chars().count();
+}
+
+fn move_cursor_left(text: &str, cursor: &mut usize) {
+    let len = text_char_len(text);
+    *cursor = (*cursor).min(len);
+    if *cursor > 0 {
+        *cursor -= 1;
+    }
+}
+
+fn move_cursor_right(text: &str, cursor: &mut usize) {
+    let len = text_char_len(text);
+    *cursor = (*cursor).min(len);
+    if *cursor < len {
+        *cursor += 1;
+    }
+}
+
+fn cursor_line_col(text: &str, cursor: usize) -> (usize, usize) {
+    let mut line = 0usize;
+    let mut col = 0usize;
+    let mut idx = 0usize;
+    let max = clamp_cursor(cursor, text);
+    for ch in text.chars() {
+        if idx == max {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+        idx += 1;
+    }
+    (line, col)
+}
+
+fn line_col_to_cursor(text: &str, line: usize, col: usize) -> usize {
+    let lines: Vec<&str> = text.split('\n').collect();
+    if lines.is_empty() {
+        return 0;
+    }
+    let target_line = line.min(lines.len().saturating_sub(1));
+    let mut idx = 0usize;
+    for i in 0..target_line {
+        idx += lines[i].chars().count();
+        idx += 1;
+    }
+    let line_len = lines[target_line].chars().count();
+    idx + col.min(line_len)
+}
+
+fn move_cursor_vertical(
+    text: &str,
+    cursor: usize,
+    direction: DirectionKey,
+    desired_col: &mut Option<usize>,
+) -> usize {
+    let len = text_char_len(text);
+    let cursor = cursor.min(len);
+    let (line, col) = cursor_line_col(text, cursor);
+    let lines = text.split('\n').count().max(1);
+    let target_line = match direction {
+        DirectionKey::Up => line.saturating_sub(1),
+        DirectionKey::Down => (line + 1).min(lines.saturating_sub(1)),
+    };
+    let desired = desired_col.get_or_insert(col);
+    line_col_to_cursor(text, target_line, *desired)
 }
 
 async fn render_worker(
@@ -2211,34 +2472,56 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
         Paragraph::new(line).style(Style::default().fg(Color::DarkGray)),
         rows[3],
     );
-    frame.render_widget(Paragraph::new(app.compose_body.as_str()), rows[4]);
+    let body_display = if app.compose_quote.is_empty() {
+        app.compose_body.clone()
+    } else {
+        let mut body = app.compose_body.clone();
+        body.push_str(&app.compose_quote);
+        body
+    };
+    frame.render_widget(Paragraph::new(body_display), rows[4]);
 
     let footer = if let Some(msg) = &app.status_message {
-        format!("Ctrl+S/F5 send   Tab next field   Ctrl+Q cancel   | {}", msg)
+        format!(
+            "Ctrl+S/F5 send   Tab next field   Shift+Tab prev field   Ctrl+Q cancel   | {}",
+            msg
+        )
     } else {
-        "Ctrl+S/F5 send   Tab next field   Ctrl+Q cancel".to_string()
+        "Ctrl+S/F5 send   Tab next field   Shift+Tab prev field   Ctrl+Q cancel".to_string()
     };
     frame.render_widget(Paragraph::new(footer), rows[5]);
 
     match app.compose_focus {
-        ComposeFocus::To => set_cursor_end(frame, to_layout[1], &app.compose_to),
-        ComposeFocus::Subject => set_cursor_end(frame, subject_layout[1], &app.compose_subject),
-        ComposeFocus::Body => set_cursor_end(frame, rows[4], &app.compose_body),
+        ComposeFocus::To => set_cursor_at(
+            frame,
+            to_layout[1],
+            &app.compose_to,
+            app.compose_cursor_to,
+        ),
+        ComposeFocus::Subject => set_cursor_at(
+            frame,
+            subject_layout[1],
+            &app.compose_subject,
+            app.compose_cursor_subject,
+        ),
+        ComposeFocus::Body => set_cursor_at(
+            frame,
+            rows[4],
+            &app.compose_body,
+            app.compose_cursor_body,
+        ),
     }
 }
 
-fn set_cursor_end(frame: &mut ratatui::Frame, area: Rect, text: &str) {
+fn set_cursor_at(frame: &mut ratatui::Frame, area: Rect, text: &str, cursor: usize) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let lines: Vec<&str> = text.split('\n').collect();
-    let last_line = lines.last().copied().unwrap_or("");
-    let line_idx = lines.len().saturating_sub(1) as u16;
-    let col = last_line.chars().count() as u16;
+    let (line, col) = cursor_line_col(text, cursor);
     let max_x = area.width.saturating_sub(1);
     let max_y = area.height.saturating_sub(1);
-    let x = area.x + col.min(max_x);
-    let y = area.y + line_idx.min(max_y);
+    let x = area.x + (col as u16).min(max_x);
+    let y = area.y + (line as u16).min(max_y);
     frame.set_cursor_position((x, y));
 }
 
