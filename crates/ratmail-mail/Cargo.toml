@@ -13,5 +13,6 @@ lettre.workspace = true
 imap.workspace = true
 native-tls.workspace = true
 imap-proto.workspace = true
+mailparse.workspace = true
 
 ratmail-core = { path = "../ratmail-core" }

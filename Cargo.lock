@@ -2908,6 +2908,7 @@ dependencies = [
  "imap",
  "imap-proto",
  "lettre",
+ "mailparse",
  "native-tls",
  "ratmail-core",
  "serde",

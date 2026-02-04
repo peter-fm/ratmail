@@ -313,7 +313,7 @@ fn fetch_imap_messages(
         let subject = envelope
             .subject
             .as_ref()
-            .map(|s| String::from_utf8_lossy(s).to_string())
+            .map(|s| decode_header_value(s))
             .unwrap_or_else(|| "(no subject)".to_string());
         let date = envelope
             .date
@@ -355,7 +355,7 @@ fn format_imap_address(addr: &ProtoAddress) -> String {
     let name = addr
         .name
         .as_ref()
-        .map(|s| String::from_utf8_lossy(s).to_string())
+        .map(|s| decode_header_value(s))
         .unwrap_or_default();
     let mailbox = addr
         .mailbox
@@ -378,5 +378,15 @@ fn format_imap_address(addr: &ProtoAddress) -> String {
         email
     } else {
         name
+    }
+}
+
+fn decode_header_value(raw: &[u8]) -> String {
+    let mut buf = Vec::with_capacity(raw.len() + 3);
+    buf.extend_from_slice(b"X: ");
+    buf.extend_from_slice(raw);
+    match mailparse::parse_header(&buf) {
+        Ok((header, _)) => header.get_value(),
+        Err(_) => String::from_utf8_lossy(raw).to_string(),
     }
 }
