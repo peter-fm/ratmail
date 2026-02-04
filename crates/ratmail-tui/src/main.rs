@@ -2135,12 +2135,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                         Line::from("Or RATMAIL_CHROME_NO_SANDBOX=1"),
                     ])
                 } else if render_no_html {
-                    Text::from(vec![
-                        Line::from(""),
-                        Line::from("No HTML part found for this message."),
-                        Line::from("Rendered mode requires HTML content."),
-                        Line::from("Switch to Text mode (v)."),
-                    ])
+                    Text::from(detail.body.as_str())
                 } else if render_tile_count == 0 && renderer_is_chromium {
                     Text::from(vec![
                         Line::from(""),
