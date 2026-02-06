@@ -403,8 +403,7 @@ impl App {
             .iter()
             .filter(|msg| Some(msg.folder_id) == folder_id)
             .collect();
-        messages.sort_by_key(|m| m.imap_uid.unwrap_or(0));
-        messages.reverse();
+        // Preserve backend ordering (already sorted by date).
         messages
     }
 
@@ -3278,6 +3277,10 @@ fn load_imap_config() -> Option<ImapConfig> {
         port: imap.get("port").and_then(|v| v.as_integer()).unwrap_or(993) as u16,
         username: imap.get("username")?.as_str()?.to_string(),
         password: imap.get("password")?.as_str()?.to_string(),
+        skip_tls_verify: imap
+            .get("skip_tls_verify")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     })
 }
 

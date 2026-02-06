@@ -15,5 +15,6 @@ imap.workspace = true
 native-tls.workspace = true
 imap-proto.workspace = true
 mailparse.workspace = true
+chrono.workspace = true
 
 ratmail-core = { path = "../ratmail-core" }

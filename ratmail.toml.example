@@ -13,6 +13,7 @@ host = "imap.example.com"
 port = 993
 username = "user@example.com"
 password = "app-password-or-imap-password"
+skip_tls_verify = false
 
 [render]
 remote_images = false
