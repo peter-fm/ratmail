@@ -577,7 +577,9 @@ fn fetch_imap_messages(
             let headers = fetch.header().unwrap_or(&[]);
             let subject =
                 header_value(headers, "Subject").unwrap_or_else(|| "(no subject)".to_string());
-            let date = header_value(headers, "Date").unwrap_or_default();
+            let date = header_value(headers, "Date")
+                .map(|d| format_date_display(&d))
+                .unwrap_or_default();
             let from = header_value(headers, "From").unwrap_or_default();
             let unread = !fetch.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen));
             messages.push(ImapMessageSummary {
@@ -667,6 +669,26 @@ fn parse_date_epoch(date: &str) -> i64 {
 
 fn is_imap_bye(err: &anyhow::Error) -> bool {
     err.to_string().to_lowercase().contains("bye response")
+}
+
+fn format_date_display(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let ok = mailparse::dateparse(trimmed).is_ok();
+    if !ok {
+        return trimmed.to_string();
+    }
+    if let Some((dow, remainder)) = trimmed.split_once(',') {
+        let remainder = remainder.trim_start();
+        let mut parts = remainder.split_whitespace().collect::<Vec<_>>();
+        if let Some(day) = parts.get_mut(0) {
+            *day = day.trim_start_matches('0');
+            if day.is_empty() {
+                *day = "0";
+            }
+        }
+        return format!("{}, {}", dow, parts.join(" "));
+    }
+    trimmed.to_string()
 }
 
 fn imap_date_from_ts(ts: i64) -> String {

@@ -228,6 +228,8 @@ struct App {
     render_tile_height_px: i64,
     render_tile_height_px_focus: i64,
     render_tile_height_px_side: i64,
+    show_preview: bool,
+    show_help: bool,
     link_index: usize,
     attach_index: usize,
     status_message: Option<String>,
@@ -331,6 +333,8 @@ impl App {
             render_tile_height_px: render_tile_height_px_side,
             render_tile_height_px_focus,
             render_tile_height_px_side,
+            show_preview: false,
+            show_help: false,
             link_index: 0,
             attach_index: 0,
             status_message: None,
@@ -419,6 +423,29 @@ impl App {
             .collect();
         // Preserve backend ordering (already sorted by date).
         messages
+    }
+
+    fn sort_folders(&mut self) {
+        const PRIORITY: [&str; 8] = [
+            "All Mail",
+            "INBOX",
+            "Starred",
+            "Sent",
+            "Drafts",
+            "Archive",
+            "Spam",
+            "Trash",
+        ];
+        self.store.folders.sort_by(|a, b| {
+            let a_idx = PRIORITY.iter().position(|p| p == &a.name);
+            let b_idx = PRIORITY.iter().position(|p| p == &b.name);
+            match (a_idx, b_idx) {
+                (Some(ai), Some(bi)) => ai.cmp(&bi),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.name.cmp(&b.name),
+            }
+        });
     }
 
     fn restore_selection(&mut self, folder_name: Option<String>, message_uid: Option<u32>) {
@@ -1248,6 +1275,12 @@ impl App {
             (KeyCode::Char('c'), _) => {
                 self.start_compose_new();
             }
+            (KeyCode::Char('p'), _) => {
+                self.show_preview = !self.show_preview;
+            }
+            (KeyCode::Char('?'), _) => {
+                self.show_help = !self.show_help;
+            }
             (KeyCode::Char('o'), _) => {
                 self.request_backfill_selected_folder();
             }
@@ -1324,6 +1357,12 @@ impl App {
             }
             (KeyCode::Char('f'), _) => {
                 self.start_compose_forward();
+            }
+            (KeyCode::Char('p'), _) => {
+                self.show_preview = !self.show_preview;
+            }
+            (KeyCode::Char('?'), _) => {
+                self.show_help = !self.show_help;
             }
             (KeyCode::Char('o'), _) => {
                 self.request_backfill_selected_folder();
@@ -2638,6 +2677,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> R
             let prev_folder = app.selected_folder().map(|f| f.name.clone());
             let prev_uid = app.selected_message().and_then(|m| m.imap_uid);
             app.store = snapshot;
+            app.sort_folders();
             app.restore_selection(prev_folder, prev_uid);
             if app.store.folders.is_empty() {
                 app.select_inbox_if_available();
@@ -2666,12 +2706,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> R
 
 fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
+    let help_height = if app.show_help { 3 } else { 2 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
-            Constraint::Length(2),
+            Constraint::Length(help_height),
         ])
         .split(area);
 
@@ -2726,16 +2767,26 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 fn render_main(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(15),
-            Constraint::Percentage(40),
-            Constraint::Percentage(45),
-        ])
+        .constraints(if app.show_preview {
+            vec![
+                Constraint::Length(15),
+                Constraint::Percentage(40),
+                Constraint::Percentage(45),
+            ]
+        } else {
+            vec![
+                Constraint::Length(15),
+                Constraint::Percentage(85),
+                Constraint::Length(0),
+            ]
+        })
         .split(area);
 
     render_folders(frame, columns[0], app);
     render_message_list(frame, columns[1], app);
-    render_message_view(frame, columns[2], app, 0);
+    if app.show_preview {
+        render_message_view(frame, columns[2], app, 0);
+    }
 }
 
 fn render_folders(frame: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -3045,14 +3096,15 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
 }
 
 fn render_help_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let mut help = String::from(
-        "Tab/h/l focus  j/k move  Enter open  v toggle view  Ctrl+S/F5 send  r reply  R reply-all  f forward  m move  d delete  q quit",
-    );
+    let mut help = if app.show_help {
+        String::from(
+            "Tab/h/l focus  j/k move  Enter open  v toggle view  p preview  o older  ? help\n\
+Ctrl+S/F5 send  r reply  R reply-all  f forward  d delete  q quit",
+        )
+    } else {
+        String::from("Tab/h/l focus  j/k move  Enter open  v view  p preview  o older  ? help  q quit")
+    };
     if let Some(msg) = &app.status_message {
-        help.push_str("  |  ");
-        help.push_str(msg);
-    }
-    if let Some(msg) = &app.imap_status {
         help.push_str("  |  ");
         help.push_str(msg);
     }
