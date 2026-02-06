@@ -27,10 +27,14 @@ The easiest way to use Gmail SMTP is with an **App Password** (requires 2‑Step
 
 1. Enable 2‑Step Verification on your Google account.
 2. Create an App Password for “Mail”.
-3. Copy `ratmail.toml.example` to `ratmail.toml` and fill it in:
+3. Copy `ratmail.toml.example` to `ratmail.toml` and fill it in (supports multiple accounts):
 
 ```toml
-[smtp]
+[[accounts]]
+name = "Gmail"
+db_path = "ratmail-gmail.db"
+
+[accounts.smtp]
 host = "smtp.gmail.com"
 port = 587
 username = "you@gmail.com"

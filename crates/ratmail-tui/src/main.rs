@@ -197,7 +197,7 @@ struct App {
     engine: MailEngine,
     events: tokio::sync::mpsc::UnboundedReceiver<MailEvent>,
     store_handle: SqliteMailStore,
-    runtime: Option<tokio::runtime::Runtime>,
+    runtime: Arc<tokio::runtime::Runtime>,
     overlay_return: Mode,
     view_scroll: u16,
     render_supported: bool,
@@ -261,6 +261,60 @@ struct App {
     compose_body_desired_col: Option<usize>,
 }
 
+struct MultiApp {
+    apps: Vec<App>,
+    current: usize,
+}
+
+impl MultiApp {
+    fn new(apps: Vec<App>) -> Self {
+        Self { apps, current: 0 }
+    }
+
+    fn current(&self) -> &App {
+        &self.apps[self.current]
+    }
+
+    fn current_mut(&mut self) -> &mut App {
+        &mut self.apps[self.current]
+    }
+
+    fn switch_next(&mut self) {
+        if !self.apps.is_empty() {
+            self.current = (self.current + 1) % self.apps.len();
+        }
+    }
+
+    fn switch_prev(&mut self) {
+        if !self.apps.is_empty() {
+            if self.current == 0 {
+                self.current = self.apps.len() - 1;
+            } else {
+                self.current -= 1;
+            }
+        }
+    }
+
+    fn account_labels(&self) -> Vec<String> {
+        self.apps
+            .iter()
+            .map(|app| app.store.account.name.clone())
+            .collect()
+    }
+
+    fn drain_all(&mut self) {
+        for app in &mut self.apps {
+            app.drain_channels();
+        }
+    }
+
+    fn tick_all(&mut self) {
+        for app in &mut self.apps {
+            app.on_tick();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ComposeAttachment {
     filename: String,
@@ -275,7 +329,7 @@ impl App {
         store_handle: SqliteMailStore,
         engine: MailEngine,
         events: tokio::sync::mpsc::UnboundedReceiver<MailEvent>,
-        runtime: tokio::runtime::Runtime,
+        runtime: Arc<tokio::runtime::Runtime>,
         render_supported: bool,
         image_picker: Option<Picker>,
         renderer_is_chromium: bool,
@@ -302,7 +356,7 @@ impl App {
             engine,
             events,
             store_handle,
-            runtime: Some(runtime),
+            runtime,
             overlay_return: Mode::View,
             view_scroll: 0,
             render_supported,
@@ -366,6 +420,7 @@ impl App {
             compose_body_desired_col: None,
         };
         app.select_inbox_if_available();
+        app.sort_folders();
         if app.imap_enabled {
             let _ = app.engine.send(MailCommand::SyncAll);
             app.imap_pending = app.imap_pending.saturating_add(2);
@@ -375,16 +430,7 @@ impl App {
     }
 
     fn runtime(&self) -> &tokio::runtime::Runtime {
-        self.runtime
-            .as_ref()
-            .expect("runtime unavailable during app lifetime")
-    }
-
-    fn shutdown(&mut self) {
-        if let Some(rt) = self.runtime.take() {
-            // Avoid hanging on long-running background tasks (e.g. IMAP sync).
-            rt.shutdown_timeout(Duration::from_millis(200));
-        }
+        &self.runtime
     }
 
     fn selected_message(&self) -> Option<&MessageSummary> {
@@ -579,6 +625,25 @@ impl App {
             Mode::ViewFocus => self.on_key_focus(key),
             Mode::Compose => self.on_key_compose(key),
             Mode::OverlayLinks | Mode::OverlayAttach => self.on_key_overlay(key),
+        }
+    }
+
+    fn drain_channels(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            self.on_event(event);
+        }
+        while let Ok(snapshot) = self.store_updates.try_recv() {
+            let prev_folder = self.selected_folder().map(|f| f.name.clone());
+            let prev_uid = self.selected_message().and_then(|m| m.imap_uid);
+            self.store = snapshot;
+            self.sort_folders();
+            self.restore_selection(prev_folder, prev_uid);
+            if self.store.folders.is_empty() {
+                self.select_inbox_if_available();
+            }
+        }
+        while let Ok(event) = self.render_events.try_recv() {
+            self.on_render_event(event);
         }
     }
 
@@ -2414,9 +2479,16 @@ async fn render_worker(
 }
 
 fn main() -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let smtp = load_smtp_config();
-    let imap = load_imap_config();
+    let rt = Arc::new(tokio::runtime::Runtime::new()?);
+    let mut accounts = load_accounts_config();
+    if accounts.is_empty() {
+        accounts.push(AccountConfig {
+            name: "demo".to_string(),
+            db_path: "ratmail.db".to_string(),
+            smtp: None,
+            imap: None,
+        });
+    }
     let render_config = load_render_config();
     let allow_remote_images = render_config.allow_remote_images
         || std::env::var("RATMAIL_REMOTE_IMAGES")
@@ -2434,182 +2506,7 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(render_config.tile_height_px_focus);
-    let (engine, events, store_handle, store, store_update_tx, store_updates) = rt.block_on(async {
-        let (engine, events) = MailEngine::start(smtp, imap.clone());
-        let store_handle = SqliteMailStore::connect("ratmail.db").await?;
-        store_handle.init().await?;
-        if let Some(imap) = &imap {
-            store_handle
-                .upsert_account(1, &imap.username, &imap.username)
-                .await?;
-        } else {
-            store_handle.seed_demo_if_empty().await?;
-        }
-        let initial_folder_id = match store_handle.folder_id_by_name(1, "INBOX").await? {
-            Some(id) => id,
-            None => store_handle.first_folder_id(1).await?.unwrap_or(1),
-        };
-        let snapshot = store_handle.load_snapshot(1, initial_folder_id).await?;
-        let (store_update_tx, mut store_update_rx) =
-            tokio::sync::mpsc::unbounded_channel::<StoreUpdate>();
-        let (store_snapshot_tx, store_updates) =
-            tokio::sync::mpsc::unbounded_channel::<StoreSnapshot>();
-        let store_for_task = store_handle.clone();
-        tokio::spawn(async move {
-            while let Some(update) = store_update_rx.recv().await {
-                let result: Result<StoreSnapshot, anyhow::Error> = (|| async {
-                    match update {
-                    StoreUpdate::Folders { account_id, folders } => {
-                            store_for_task.upsert_folders(account_id, &folders).await?;
-                            let folder_id = match store_for_task
-                                .folder_id_by_name(account_id, "INBOX")
-                                .await?
-                            {
-                                Some(id) => id,
-                                None => store_for_task.first_folder_id(account_id).await?.unwrap_or(1),
-                            };
-                            store_for_task.load_snapshot(account_id, folder_id).await
-                        }
-                    StoreUpdate::AppendMessages {
-                        account_id,
-                        folder_name,
-                        messages,
-                        sync_update,
-                    } => {
-                        let mut folder_id = store_for_task
-                            .folder_id_by_name(account_id, &folder_name)
-                            .await?;
-                        if folder_id.is_none() {
-                            let fallback = Folder {
-                                id: 0,
-                                account_id,
-                                name: folder_name.clone(),
-                                unread: 0,
-                            };
-                            store_for_task.upsert_folders(account_id, &[fallback]).await?;
-                            folder_id = store_for_task
-                                .folder_id_by_name(account_id, &folder_name)
-                                .await?;
-                        }
-                        if let Some(folder_id) = folder_id {
-                            let items: Vec<MessageSummary> = messages
-                                .into_iter()
-                                .map(|mut m| {
-                                    m.folder_id = folder_id;
-                                    m
-                                })
-                                .collect();
-                            store_for_task
-                                .upsert_folder_messages_append(account_id, folder_id, &items)
-                                .await?;
-                            if let Some(update) = sync_update {
-                                let existing = store_for_task
-                                    .get_folder_sync_state(folder_id)
-                                    .await?
-                                    .unwrap_or(FolderSyncState {
-                                        folder_id,
-                                        uidvalidity: None,
-                                        uidnext: None,
-                                        last_seen_uid: None,
-                                        last_sync_ts: None,
-                                        oldest_ts: None,
-                                    });
-                                let merged = FolderSyncState {
-                                    folder_id,
-                                    uidvalidity: existing.uidvalidity,
-                                    uidnext: existing.uidnext,
-                                    last_seen_uid: match (existing.last_seen_uid, update.last_seen_uid) {
-                                        (Some(a), Some(b)) => Some(a.max(b)),
-                                        (Some(a), None) => Some(a),
-                                        (None, Some(b)) => Some(b),
-                                        (None, None) => None,
-                                    },
-                                    last_sync_ts: Some(update.last_sync_ts),
-                                    oldest_ts: match (existing.oldest_ts, update.oldest_ts) {
-                                        (Some(a), Some(b)) => Some(a.min(b)),
-                                        (Some(a), None) => Some(a),
-                                        (None, Some(b)) => Some(b),
-                                        (None, None) => None,
-                                    },
-                                };
-                                store_for_task.upsert_folder_sync_state(&merged).await?;
-                            }
-                            log_debug(&format!(
-                                "store_update messages folder={} id={} count={}",
-                                folder_name,
-                                folder_id,
-                                items.len()
-                            ));
-                            store_for_task.load_snapshot(account_id, folder_id).await
-                        } else {
-                            log_debug(&format!(
-                                "store_update messages folder_missing folder={}",
-                                folder_name
-                            ));
-                            let folder_id = match store_for_task
-                                .folder_id_by_name(account_id, "INBOX")
-                                .await?
-                            {
-                                Some(id) => id,
-                                None => store_for_task.first_folder_id(account_id).await?.unwrap_or(1),
-                            };
-                            store_for_task.load_snapshot(account_id, folder_id).await
-                        }
-                    }
-                    StoreUpdate::RawBody {
-                        account_id,
-                        message_id,
-                        raw,
-                        cached_text,
-                    } => {
-                        store_for_task.upsert_raw_body(message_id, &raw).await?;
-                        // Use cached_text if available, otherwise extract from raw
-                        let text = cached_text.or_else(|| {
-                            extract_display(&raw, DEFAULT_TEXT_WIDTH as usize)
-                                .ok()
-                                .map(|d| d.text)
-                        });
-                        if let Some(text) = text {
-                            let _ = store_for_task
-                                .upsert_cache_text(message_id, DEFAULT_TEXT_WIDTH, &text)
-                                .await;
-                        }
-                        let folder_id = match store_for_task
-                            .folder_id_by_name(account_id, "INBOX")
-                            .await?
-                        {
-                            Some(id) => id,
-                            None => store_for_task.first_folder_id(account_id).await?.unwrap_or(1),
-                        };
-                        store_for_task.load_snapshot(account_id, folder_id).await
-                    }
-                }
-                })()
-                .await;
-                match result {
-                    Ok(snapshot) => {
-                        log_debug(&format!(
-                            "store_snapshot folders={} messages={}",
-                            snapshot.folders.len(),
-                            snapshot.messages.len()
-                        ));
-                        let _ = store_snapshot_tx.send(snapshot);
-                    }
-                    Err(err) => {
-                        log_debug(&format!("store_update error {}", err));
-                    }
-                }
-            }
-        });
-        Ok::<_, anyhow::Error>((
-            engine,
-            events,
-            store_handle,
-            snapshot,
-            store_update_tx,
-            store_updates,
-        ))
-    })?;
+    let mut apps: Vec<App> = Vec::new();
 
     // Query terminal capabilities BEFORE entering alternate screen
     let picker = Picker::from_query_stdio().ok();
@@ -2636,37 +2533,215 @@ fn main() -> Result<()> {
             Err(_) => (Arc::new(ChromiumRenderer::default()), true),
         };
 
-    let (render_request_tx, render_request_rx) = tokio::sync::watch::channel(RenderRequest {
-        request_id: 0,
-        message_ids: Vec::new(),
-        width_px: 800,
-        tile_height_px: 120,
-        max_tiles: None,
-        theme: "default".to_string(),
-        remote_policy: "blocked".to_string(),
-    });
-    let (render_event_tx, render_event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let store_for_worker = store_handle.clone();
-    let renderer_for_worker = renderer.clone();
-    let handle = rt.handle().clone();
-    handle.spawn(render_worker(
-        render_request_rx,
-        render_event_tx,
-        store_for_worker,
-        renderer_for_worker,
-    ));
+    for account in accounts {
+        let (engine, events, store_handle, store, store_update_tx, store_updates) =
+            rt.block_on(async {
+                let (engine, events) =
+                    MailEngine::start(account.smtp.clone(), account.imap.clone());
+                let store_handle = SqliteMailStore::connect(&account.db_path).await?;
+                store_handle.init().await?;
+                if let Some(imap) = &account.imap {
+                    store_handle
+                        .upsert_account(1, &account.name, &imap.username)
+                        .await?;
+                } else {
+                    store_handle.seed_demo_if_empty().await?;
+                }
+                let initial_folder_id = match store_handle.folder_id_by_name(1, "INBOX").await? {
+                    Some(id) => id,
+                    None => store_handle.first_folder_id(1).await?.unwrap_or(1),
+                };
+                let snapshot = store_handle.load_snapshot(1, initial_folder_id).await?;
+                let (store_update_tx, mut store_update_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<StoreUpdate>();
+                let (store_snapshot_tx, store_updates) =
+                    tokio::sync::mpsc::unbounded_channel::<StoreSnapshot>();
+                let store_for_task = store_handle.clone();
+                tokio::spawn(async move {
+                    while let Some(update) = store_update_rx.recv().await {
+                        let result: Result<StoreSnapshot, anyhow::Error> = (|| async {
+                            match update {
+                            StoreUpdate::Folders { account_id, folders } => {
+                                    store_for_task.upsert_folders(account_id, &folders).await?;
+                                    let folder_id = match store_for_task
+                                        .folder_id_by_name(account_id, "INBOX")
+                                        .await?
+                                    {
+                                        Some(id) => id,
+                                        None => store_for_task.first_folder_id(account_id).await?.unwrap_or(1),
+                                    };
+                                    store_for_task.load_snapshot(account_id, folder_id).await
+                                }
+                            StoreUpdate::AppendMessages {
+                                account_id,
+                                folder_name,
+                                messages,
+                                sync_update,
+                            } => {
+                                let mut folder_id = store_for_task
+                                    .folder_id_by_name(account_id, &folder_name)
+                                    .await?;
+                                if folder_id.is_none() {
+                                    let fallback = Folder {
+                                        id: 0,
+                                        account_id,
+                                        name: folder_name.clone(),
+                                        unread: 0,
+                                    };
+                                    store_for_task.upsert_folders(account_id, &[fallback]).await?;
+                                    folder_id = store_for_task
+                                        .folder_id_by_name(account_id, &folder_name)
+                                        .await?;
+                                }
+                                if let Some(folder_id) = folder_id {
+                                    let items: Vec<MessageSummary> = messages
+                                        .into_iter()
+                                        .map(|mut m| {
+                                            m.folder_id = folder_id;
+                                            m
+                                        })
+                                        .collect();
+                                    store_for_task
+                                        .upsert_folder_messages_append(account_id, folder_id, &items)
+                                        .await?;
+                                    if let Some(update) = sync_update {
+                                        let existing = store_for_task
+                                            .get_folder_sync_state(folder_id)
+                                            .await?
+                                            .unwrap_or(FolderSyncState {
+                                                folder_id,
+                                                uidvalidity: None,
+                                                uidnext: None,
+                                                last_seen_uid: None,
+                                                last_sync_ts: None,
+                                                oldest_ts: None,
+                                            });
+                                        let merged = FolderSyncState {
+                                            folder_id,
+                                            uidvalidity: existing.uidvalidity,
+                                            uidnext: existing.uidnext,
+                                            last_seen_uid: match (existing.last_seen_uid, update.last_seen_uid) {
+                                                (Some(a), Some(b)) => Some(a.max(b)),
+                                                (Some(a), None) => Some(a),
+                                                (None, Some(b)) => Some(b),
+                                                (None, None) => None,
+                                            },
+                                            last_sync_ts: Some(update.last_sync_ts),
+                                            oldest_ts: match (existing.oldest_ts, update.oldest_ts) {
+                                                (Some(a), Some(b)) => Some(a.min(b)),
+                                                (Some(a), None) => Some(a),
+                                                (None, Some(b)) => Some(b),
+                                                (None, None) => None,
+                                            },
+                                        };
+                                        store_for_task.upsert_folder_sync_state(&merged).await?;
+                                    }
+                                    log_debug(&format!(
+                                        "store_update messages folder={} id={} count={}",
+                                        folder_name,
+                                        folder_id,
+                                        items.len()
+                                    ));
+                                    store_for_task.load_snapshot(account_id, folder_id).await
+                                } else {
+                                    log_debug(&format!(
+                                        "store_update messages folder_missing folder={}",
+                                        folder_name
+                                    ));
+                                    let folder_id = match store_for_task
+                                        .folder_id_by_name(account_id, "INBOX")
+                                        .await?
+                                    {
+                                        Some(id) => id,
+                                        None => store_for_task.first_folder_id(account_id).await?.unwrap_or(1),
+                                    };
+                                    store_for_task.load_snapshot(account_id, folder_id).await
+                                }
+                            }
+                            StoreUpdate::RawBody {
+                                account_id,
+                                message_id,
+                                raw,
+                                cached_text,
+                            } => {
+                                store_for_task.upsert_raw_body(message_id, &raw).await?;
+                                let text = cached_text.or_else(|| {
+                                    extract_display(&raw, DEFAULT_TEXT_WIDTH as usize)
+                                        .ok()
+                                        .map(|d| d.text)
+                                });
+                                if let Some(text) = text {
+                                    let _ = store_for_task
+                                        .upsert_cache_text(message_id, DEFAULT_TEXT_WIDTH, &text)
+                                        .await;
+                                }
+                                let folder_id = match store_for_task
+                                    .folder_id_by_name(account_id, "INBOX")
+                                    .await?
+                                {
+                                    Some(id) => id,
+                                    None => store_for_task.first_folder_id(account_id).await?.unwrap_or(1),
+                                };
+                                store_for_task.load_snapshot(account_id, folder_id).await
+                            }
+                        }
+                        })()
+                        .await;
+                        match result {
+                            Ok(snapshot) => {
+                                log_debug(&format!(
+                                    "store_snapshot folders={} messages={}",
+                                    snapshot.folders.len(),
+                                    snapshot.messages.len()
+                                ));
+                                let _ = store_snapshot_tx.send(snapshot);
+                            }
+                            Err(err) => {
+                                log_debug(&format!("store_update error {}", err));
+                            }
+                        }
+                    }
+                });
+                Ok::<_, anyhow::Error>((
+                    engine,
+                    events,
+                    store_handle,
+                    snapshot,
+                    store_update_tx,
+                    store_updates,
+                ))
+            })?;
 
-    let initial_sync_days = imap.as_ref().map(|i| i.initial_sync_days).unwrap_or(90);
-    let res = run_app(
-        &mut terminal,
-        App::new(
+        let (render_request_tx, render_request_rx) =
+            tokio::sync::watch::channel(RenderRequest {
+                request_id: 0,
+                message_ids: Vec::new(),
+                width_px: 800,
+                tile_height_px: 120,
+                max_tiles: None,
+                theme: "default".to_string(),
+                remote_policy: "blocked".to_string(),
+            });
+        let (render_event_tx, render_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let store_for_worker = store_handle.clone();
+        let renderer_for_worker = renderer.clone();
+        let handle = rt.handle().clone();
+        handle.spawn(render_worker(
+            render_request_rx,
+            render_event_tx,
+            store_for_worker,
+            renderer_for_worker,
+        ));
+
+        let initial_sync_days = account.imap.as_ref().map(|i| i.initial_sync_days).unwrap_or(90);
+        let app = App::new(
             store,
             store_handle,
             engine,
             events,
-            rt,
+            rt.clone(),
             render_supported,
-            picker,
+            picker.clone(),
             renderer_is_chromium,
             render_request_tx,
             render_event_rx,
@@ -2676,57 +2751,68 @@ fn main() -> Result<()> {
             render_width_px,
             render_tile_height_px_side,
             render_tile_height_px_focus,
-            imap.is_some(),
+            account.imap.is_some(),
             initial_sync_days,
-        ),
-    );
+        );
+        apps.push(app);
+    }
+
+    let res = run_app(&mut terminal, MultiApp::new(apps), rt.clone());
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
+    if let Ok(rt) = Arc::try_unwrap(rt) {
+        rt.shutdown_timeout(Duration::from_millis(200));
+    }
     res
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> Result<()> {
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    mut multi: MultiApp,
+    rt: Arc<tokio::runtime::Runtime>,
+) -> Result<()> {
     loop {
-        terminal.draw(|frame| ui(frame, &mut app))?;
+        terminal.draw(|frame| ui(frame, &mut multi))?;
 
-        while let Ok(event) = app.events.try_recv() {
-            app.on_event(event);
-        }
-        while let Ok(snapshot) = app.store_updates.try_recv() {
-            let prev_folder = app.selected_folder().map(|f| f.name.clone());
-            let prev_uid = app.selected_message().and_then(|m| m.imap_uid);
-            app.store = snapshot;
-            app.sort_folders();
-            app.restore_selection(prev_folder, prev_uid);
-            if app.store.folders.is_empty() {
-                app.select_inbox_if_available();
-            }
-        }
-        while let Ok(event) = app.render_events.try_recv() {
-            app.on_render_event(event);
-        }
+        multi.drain_all();
 
-        let timeout = TICK_RATE.saturating_sub(app.last_tick.elapsed());
+        let timeout = TICK_RATE.saturating_sub(multi.current().last_tick.elapsed());
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
-                if app.on_key(key) {
-                    app.shutdown();
-                    return Ok(());
+                match key.code {
+                    KeyCode::Char('[') => multi.switch_prev(),
+                    KeyCode::Char(']') => multi.switch_next(),
+                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                        let idx = c.to_digit(10).unwrap_or(0);
+                        if idx > 0 && (idx as usize) <= multi.apps.len() {
+                            multi.current = (idx as usize) - 1;
+                        }
+                    }
+                    _ => {
+                        if multi.current_mut().on_key(key) {
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
 
-        if app.last_tick.elapsed() >= TICK_RATE {
-            app.last_tick = Instant::now();
-            app.on_tick();
+        if multi.current().last_tick.elapsed() >= TICK_RATE {
+            for app in &mut multi.apps {
+                app.last_tick = Instant::now();
+            }
+            multi.tick_all();
         }
     }
 }
 
-fn ui(frame: &mut ratatui::Frame, app: &mut App) {
+fn ui(frame: &mut ratatui::Frame, multi: &mut MultiApp) {
+    let labels = multi.account_labels();
+    let current_idx = multi.current;
+    let app = multi.current_mut();
     let area = frame.area();
     let help_height = if app.show_help { 3 } else { 2 };
     let layout = Layout::default()
@@ -2738,7 +2824,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         ])
         .split(area);
 
-    render_status_bar(frame, layout[0], app);
+    render_status_bar(frame, layout[0], app, &labels, current_idx);
     render_main(frame, layout[1], app);
     render_help_bar(frame, layout[2], app);
 
@@ -2755,25 +2841,37 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     }
 }
 
-fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_status_bar(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+    labels: &[String],
+    current_idx: usize,
+) {
     let view_label = match app.view_mode {
         ViewMode::Text => "TEXT",
         ViewMode::Rendered => "RENDERED",
     };
 
-    let mut spans = vec![
-        Span::styled(
-            format!(" acct: {} ", app.store.account.address),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::raw(" INBOX (2,184) "),
-        Span::raw(format!(" sync: {} ", app.sync_status)),
-        Span::styled(
-            format!(" view: {} (v) ", view_label),
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::raw(" [/] search "),
-    ];
+    let mut spans = Vec::new();
+    if !labels.is_empty() {
+        spans.push(Span::raw(" "));
+        for (idx, label) in labels.iter().enumerate() {
+            let style = if idx == current_idx {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            spans.push(Span::styled(format!(" {}:{} ", idx + 1, label), style));
+        }
+    }
+    spans.push(Span::raw(format!(" acct: {} ", app.store.account.address)));
+    spans.push(Span::raw(format!(" sync: {} ", app.sync_status)));
+    spans.push(Span::styled(
+        format!(" view: {} (v) ", view_label),
+        Style::default().fg(Color::Yellow),
+    ));
+    spans.push(Span::raw(" [/] search "));
     if let Some(msg) = &app.status_message {
         spans.push(Span::raw(format!(" | {}", msg)));
     }
@@ -3143,11 +3241,11 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
 fn render_help_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let mut help = if app.show_help {
         String::from(
-            "Tab/h/l focus  j/k move  Enter open  v toggle view  p preview  o older  ? help\n\
+            "Tab/h/l focus  j/k move  Enter open  v toggle view  p preview  o older  [ ] switch acct  ? help\n\
 Ctrl+S/F5 send  r reply  R reply-all  f forward  d delete  q quit",
         )
     } else {
-        String::from("Tab/h/l focus  j/k move  Enter open  v view  p preview  o older  ? help  q quit")
+        String::from("Tab/h/l focus  j/k move  Enter open  v view  p preview  o older  [ ] acct  ? help  q quit")
     };
     if let Some(msg) = &app.status_message {
         help.push_str("  |  ");
@@ -3556,11 +3654,77 @@ fn render_view_focus(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     render_message_view(frame, inner, app, app.view_scroll);
 }
 
-fn load_smtp_config() -> Option<SmtpConfig> {
+#[derive(Debug, Clone)]
+struct AccountConfig {
+    name: String,
+    db_path: String,
+    smtp: Option<SmtpConfig>,
+    imap: Option<ImapConfig>,
+}
+
+fn load_accounts_config() -> Vec<AccountConfig> {
     let path = "ratmail.toml";
-    let content = std::fs::read_to_string(path).ok()?;
-    let value: toml::Value = toml::from_str(&content).ok()?;
-    let smtp = value.get("smtp")?;
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let value: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    if let Some(accounts) = value.get("accounts").and_then(|v| v.as_array()) {
+        return accounts
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, acct)| parse_account_config(acct, idx))
+            .collect();
+    }
+    let smtp = parse_smtp_config(&value);
+    let imap = parse_imap_config(&value);
+    let name = imap
+        .as_ref()
+        .map(|i| i.username.clone())
+        .or_else(|| smtp.as_ref().map(|s| s.username.clone()))
+        .unwrap_or_else(|| "account".to_string());
+    let db_path = "ratmail.db".to_string();
+    vec![AccountConfig {
+        name,
+        db_path,
+        smtp,
+        imap,
+    }]
+}
+
+fn parse_account_config(value: &toml::Value, index: usize) -> Option<AccountConfig> {
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let smtp = value.get("smtp").and_then(parse_smtp_table);
+    let imap = value.get("imap").and_then(parse_imap_table);
+    let derived = name
+        .clone()
+        .or_else(|| imap.as_ref().map(|i| i.username.clone()))
+        .or_else(|| smtp.as_ref().map(|s| s.username.clone()))
+        .unwrap_or_else(|| format!("account-{}", index + 1));
+    let db_path = value
+        .get("db_path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("ratmail-{}.db", slugify_name(&derived)));
+    Some(AccountConfig {
+        name: derived,
+        db_path,
+        smtp,
+        imap,
+    })
+}
+
+fn parse_smtp_config(value: &toml::Value) -> Option<SmtpConfig> {
+    value.get("smtp").and_then(parse_smtp_table)
+}
+
+fn parse_smtp_table(smtp: &toml::Value) -> Option<SmtpConfig> {
     Some(SmtpConfig {
         host: smtp.get("host")?.as_str()?.to_string(),
         port: smtp.get("port").and_then(|v| v.as_integer()).unwrap_or(587) as u16,
@@ -3570,11 +3734,11 @@ fn load_smtp_config() -> Option<SmtpConfig> {
     })
 }
 
-fn load_imap_config() -> Option<ImapConfig> {
-    let path = "ratmail.toml";
-    let content = std::fs::read_to_string(path).ok()?;
-    let value: toml::Value = toml::from_str(&content).ok()?;
-    let imap = value.get("imap")?;
+fn parse_imap_config(value: &toml::Value) -> Option<ImapConfig> {
+    value.get("imap").and_then(parse_imap_table)
+}
+
+fn parse_imap_table(imap: &toml::Value) -> Option<ImapConfig> {
     Some(ImapConfig {
         host: imap.get("host")?.as_str()?.to_string(),
         port: imap.get("port").and_then(|v| v.as_integer()).unwrap_or(993) as u16,
@@ -3595,6 +3759,27 @@ fn load_imap_config() -> Option<ImapConfig> {
             .map(|v| v.clamp(1, 50) as usize)
             .unwrap_or(10),
     })
+}
+
+fn slugify_name(raw: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            out.push(lower);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "account".to_string()
+    } else {
+        trimmed
+    }
 }
 
 struct RenderConfig {

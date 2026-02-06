@@ -1,14 +1,18 @@
 # Copy to ratmail.toml and fill in your SMTP credentials.
 # Keep this file private (do not commit).
+# Multi-account format:
+[[accounts]]
+name = "Personal"
+db_path = "ratmail-personal.db"
 
-[smtp]
+[accounts.smtp]
 host = "smtp.example.com"
 port = 587
 username = "user@example.com"
 password = "app-password-or-smtp-password"
 from = "Your Name <user@example.com>"
 
-[imap]
+[accounts.imap]
 host = "imap.example.com"
 port = 993
 username = "user@example.com"
@@ -16,6 +20,8 @@ password = "app-password-or-imap-password"
 skip_tls_verify = false
 initial_sync_days = 90
 fetch_chunk_size = 10
+
+# Add more accounts by repeating [[accounts]] blocks.
 
 [render]
 remote_images = false
