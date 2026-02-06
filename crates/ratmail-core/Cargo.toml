@@ -9,3 +9,4 @@ anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 sqlx.workspace = true
+mailparse.workspace = true

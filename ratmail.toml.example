@@ -14,6 +14,8 @@ port = 993
 username = "user@example.com"
 password = "app-password-or-imap-password"
 skip_tls_verify = false
+initial_sync_days = 90
+fetch_chunk_size = 10
 
 [render]
 remote_images = false

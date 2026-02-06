@@ -8,7 +8,7 @@ use lettre::{
 };
 use mailparse::{addrparse, MailAddr};
 use imap::{ClientBuilder, ConnectionMode};
-use chrono::{Datelike, Duration, Local};
+use chrono::{Datelike, Duration, Local, TimeZone};
 use imap_proto::types::Address as ProtoAddress;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -27,7 +27,7 @@ pub enum MailCommand {
     },
     SetFlag { message_id: i64, seen: bool },
     SyncAll,
-    SyncFolderByName { name: String },
+    SyncFolderByName { name: String, mode: SyncMode },
     SendMessage {
         to: String,
         cc: String,
@@ -36,6 +36,13 @@ pub enum MailCommand {
         body: String,
         attachments: Vec<OutgoingAttachment>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum SyncMode {
+    Initial { days: i64 },
+    Incremental { last_seen_uid: u32 },
+    Backfill { before_ts: i64, window_days: i64 },
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +77,8 @@ pub struct ImapConfig {
     pub username: String,
     pub password: String,
     pub skip_tls_verify: bool,
+    pub initial_sync_days: i64,
+    pub fetch_chunk_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,10 +171,12 @@ impl MailEngine {
                             tokio::task::spawn_blocking(move || sync_all_imap(imap, tx));
                         }
                     }
-                    MailCommand::SyncFolderByName { name } => {
+                    MailCommand::SyncFolderByName { name, mode } => {
                         if let Some(imap) = imap.clone() {
                             let tx = evt_tx.clone();
-                            tokio::task::spawn_blocking(move || sync_folder_imap(imap, name, tx));
+                            tokio::task::spawn_blocking(move || {
+                                sync_folder_imap(imap, name, mode, tx)
+                            });
                         }
                     }
                     MailCommand::FetchMessageBody {
@@ -336,7 +347,7 @@ fn mailaddrs_to_mailboxes(addrs: &[MailAddr]) -> Vec<Mailbox> {
 
 fn sync_all_imap(imap: ImapConfig, tx: mpsc::UnboundedSender<MailEvent>) {
     log_debug("imap_sync_all start");
-    match fetch_imap_all(&imap) {
+    match fetch_imap_all(&imap, imap.initial_sync_days, imap.fetch_chunk_size) {
         Ok((folders, inbox_messages)) => {
             let _ = tx.send(MailEvent::ImapFolders(folders));
             let _ = tx.send(MailEvent::ImapMessages {
@@ -346,6 +357,19 @@ fn sync_all_imap(imap: ImapConfig, tx: mpsc::UnboundedSender<MailEvent>) {
         }
         Err(err) => {
             log_debug(&format!("imap_sync_all error {}", err));
+            if is_imap_bye(&err) {
+                log_debug("imap_sync_all retry after BYE");
+                if let Ok((folders, inbox_messages)) =
+                    fetch_imap_all(&imap, imap.initial_sync_days, imap.fetch_chunk_size)
+                {
+                    let _ = tx.send(MailEvent::ImapFolders(folders));
+                    let _ = tx.send(MailEvent::ImapMessages {
+                        folder_name: "INBOX".to_string(),
+                        messages: inbox_messages,
+                    });
+                    return;
+                }
+            }
             let _ = tx.send(MailEvent::ImapError {
                 reason: err.to_string(),
             });
@@ -356,10 +380,11 @@ fn sync_all_imap(imap: ImapConfig, tx: mpsc::UnboundedSender<MailEvent>) {
 fn sync_folder_imap(
     imap: ImapConfig,
     folder_name: String,
+    mode: SyncMode,
     tx: mpsc::UnboundedSender<MailEvent>,
 ) {
     log_debug(&format!("imap_sync_folder start folder={}", folder_name));
-    match fetch_imap_folder(&imap, &folder_name) {
+    match fetch_imap_folder(&imap, &folder_name, mode.clone(), imap.fetch_chunk_size) {
         Ok(messages) => {
             let _ = tx.send(MailEvent::ImapMessages {
                 folder_name,
@@ -368,6 +393,18 @@ fn sync_folder_imap(
         }
         Err(err) => {
             log_debug(&format!("imap_sync_folder error {}", err));
+            if is_imap_bye(&err) {
+                log_debug("imap_sync_folder retry after BYE");
+                if let Ok(messages) =
+                    fetch_imap_folder(&imap, &folder_name, mode, imap.fetch_chunk_size)
+                {
+                    let _ = tx.send(MailEvent::ImapMessages {
+                        folder_name,
+                        messages,
+                    });
+                    return;
+                }
+            }
             let _ = tx.send(MailEvent::ImapError {
                 reason: err.to_string(),
             });
@@ -375,7 +412,11 @@ fn sync_folder_imap(
     }
 }
 
-fn fetch_imap_all(imap: &ImapConfig) -> Result<(Vec<ImapFolder>, Vec<ImapMessageSummary>)> {
+fn fetch_imap_all(
+    imap: &ImapConfig,
+    initial_sync_days: i64,
+    fetch_chunk_size: usize,
+) -> Result<(Vec<ImapFolder>, Vec<ImapMessageSummary>)> {
     log_debug(&format!(
         "imap_fetch_all connect host={} port={}",
         imap.host, imap.port
@@ -384,7 +425,14 @@ fn fetch_imap_all(imap: &ImapConfig) -> Result<(Vec<ImapFolder>, Vec<ImapMessage
     log_debug("imap_fetch_all connected");
     let folders = fetch_imap_folders(&mut session)?;
     log_debug(&format!("imap_fetch_all folders count={}", folders.len()));
-    let inbox_messages = fetch_imap_messages(&mut session, "INBOX")?;
+    let inbox_messages = fetch_imap_messages(
+        &mut session,
+        "INBOX",
+        SyncMode::Initial {
+            days: initial_sync_days,
+        },
+        fetch_chunk_size,
+    )?;
     log_debug(&format!(
         "imap_fetch_all inbox messages count={}",
         inbox_messages.len()
@@ -394,14 +442,19 @@ fn fetch_imap_all(imap: &ImapConfig) -> Result<(Vec<ImapFolder>, Vec<ImapMessage
     Ok((folders, inbox_messages))
 }
 
-fn fetch_imap_folder(imap: &ImapConfig, folder: &str) -> Result<Vec<ImapMessageSummary>> {
+fn fetch_imap_folder(
+    imap: &ImapConfig,
+    folder: &str,
+    mode: SyncMode,
+    fetch_chunk_size: usize,
+) -> Result<Vec<ImapMessageSummary>> {
     log_debug(&format!(
         "imap_fetch_folder connect host={} port={} folder={}",
         imap.host, imap.port, folder
     ));
     let mut session = imap_connect(imap)?;
     log_debug("imap_fetch_folder connected");
-    let messages = fetch_imap_messages(&mut session, folder)?;
+    let messages = fetch_imap_messages(&mut session, folder, mode, fetch_chunk_size)?;
     log_debug(&format!(
         "imap_fetch_folder messages count={} folder={}",
         messages.len(),
@@ -456,6 +509,8 @@ fn fetch_imap_folders(session: &mut imap::Session<imap::Connection>) -> Result<V
 fn fetch_imap_messages(
     session: &mut imap::Session<imap::Connection>,
     folder: &str,
+    mode: SyncMode,
+    fetch_chunk_size: usize,
 ) -> Result<Vec<ImapMessageSummary>> {
     log_debug(&format!("imap_fetch_messages select folder={}", folder));
     let mailbox = session.select(folder)?;
@@ -467,8 +522,25 @@ fn fetch_imap_messages(
     if total == 0 {
         return Ok(Vec::new());
     }
-    let since = imap_search_since(365);
-    let search_query = format!("SINCE {}", since);
+    let search_query = match mode {
+        SyncMode::Incremental { last_seen_uid } => {
+            format!("UID {}:*", last_seen_uid.saturating_add(1))
+        }
+        SyncMode::Backfill {
+            before_ts,
+            window_days,
+        } => {
+            let before = imap_date_from_ts(before_ts);
+            let since = imap_date_from_ts(
+                before_ts.saturating_sub(window_days.saturating_mul(24 * 60 * 60)),
+            );
+            format!("SINCE {} BEFORE {}", since, before)
+        }
+        SyncMode::Initial { days } => {
+            let since = imap_search_since(days);
+            format!("SINCE {}", since)
+        }
+    };
     log_debug(&format!(
         "imap_fetch_messages uid_list folder={} query={}",
         folder, search_query
@@ -484,7 +556,8 @@ fn fetch_imap_messages(
     }
     let tail = &uids_vec[..];
     let mut messages = Vec::new();
-    for chunk in tail.chunks(10) {
+    let chunk_size = fetch_chunk_size.max(1);
+    for chunk in tail.chunks(chunk_size) {
         let uid_set = chunk
             .iter()
             .map(|uid| uid.to_string())
@@ -585,7 +658,24 @@ fn header_value(raw: &[u8], name: &str) -> Option<String> {
 
 fn imap_search_since(days_back: i64) -> String {
     let target = Local::now() - Duration::days(days_back);
-    let month = match target.month() {
+    imap_date_from_parts(target.year(), target.month(), target.day())
+}
+
+fn parse_date_epoch(date: &str) -> i64 {
+    mailparse::dateparse(date).unwrap_or(0)
+}
+
+fn is_imap_bye(err: &anyhow::Error) -> bool {
+    err.to_string().to_lowercase().contains("bye response")
+}
+
+fn imap_date_from_ts(ts: i64) -> String {
+    let dt = Local.timestamp_opt(ts, 0).single().unwrap_or_else(|| Local.timestamp_opt(0, 0).unwrap());
+    imap_date_from_parts(dt.year(), dt.month(), dt.day())
+}
+
+fn imap_date_from_parts(year: i32, month: u32, day: u32) -> String {
+    let month = match month {
         1 => "Jan",
         2 => "Feb",
         3 => "Mar",
@@ -600,9 +690,5 @@ fn imap_search_since(days_back: i64) -> String {
         12 => "Dec",
         _ => "Jan",
     };
-    format!("{}-{}-{}", target.day(), month, target.year())
-}
-
-fn parse_date_epoch(date: &str) -> i64 {
-    mailparse::dateparse(date).unwrap_or(0)
+    format!("{}-{}-{}", day, month, year)
 }

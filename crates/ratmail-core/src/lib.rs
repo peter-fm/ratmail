@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use mailparse::dateparse;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, SqlitePool};
 
@@ -18,6 +19,16 @@ pub struct Folder {
     pub account_id: i64,
     pub name: String,
     pub unread: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderSyncState {
+    pub folder_id: i64,
+    pub uidvalidity: Option<i64>,
+    pub uidnext: Option<i64>,
+    pub last_seen_uid: Option<i64>,
+    pub last_sync_ts: Option<i64>,
+    pub oldest_ts: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +77,10 @@ pub struct TileMeta {
 }
 
 pub const DEFAULT_TEXT_WIDTH: i64 = 80;
+
+fn parse_date_ts(date: &str) -> i64 {
+    dateparse(date).unwrap_or(0)
+}
 
 #[async_trait]
 pub trait MailStore: Send + Sync {
@@ -345,6 +360,61 @@ impl SqliteMailStore {
         Ok(())
     }
 
+    pub async fn upsert_folder_messages_append(
+        &self,
+        account_id: i64,
+        folder_id: i64,
+        messages: &[MessageSummary],
+    ) -> Result<()> {
+        for msg in messages {
+            let uid = msg.imap_uid.map(|v| v as i64);
+            let exists = if let Some(uid) = uid {
+                sqlx::query_as::<_, (i64,)>(
+                    "SELECT id FROM messages WHERE folder_id = ? AND imap_uid = ?",
+                )
+                .bind(folder_id)
+                .bind(uid)
+                .fetch_optional(&self.pool)
+                .await?
+                .map(|r| r.0)
+            } else {
+                None
+            };
+            if let Some(id) = exists {
+                sqlx::query(
+                    "UPDATE messages SET date = ?, date_ts = ?, from_addr = ?, subject = ?, unread = ?, preview = ?
+                     WHERE id = ?",
+                )
+                .bind(&msg.date)
+                .bind(parse_date_ts(&msg.date))
+                .bind(&msg.from)
+                .bind(&msg.subject)
+                .bind(if msg.unread { 1 } else { 0 })
+                .bind(&msg.preview)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO messages (account_id, folder_id, imap_uid, date, date_ts, from_addr, subject, unread, preview)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(account_id)
+                .bind(folder_id)
+                .bind(uid)
+                .bind(&msg.date)
+                .bind(parse_date_ts(&msg.date))
+                .bind(&msg.from)
+                .bind(&msg.subject)
+                .bind(if msg.unread { 1 } else { 0 })
+                .bind(&msg.preview)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn folder_id_by_name(&self, account_id: i64, name: &str) -> Result<Option<i64>> {
         let row = sqlx::query_as::<_, (i64,)>(
             "SELECT id FROM folders WHERE account_id = ? AND name = ?",
@@ -364,6 +434,53 @@ impl SqliteMailStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.0))
+    }
+
+    pub async fn get_folder_sync_state(
+        &self,
+        folder_id: i64,
+    ) -> Result<Option<FolderSyncState>> {
+        let row = sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>)>(
+            "SELECT folder_id, uidvalidity, uidnext, last_seen_uid, last_sync_ts, oldest_ts
+             FROM folder_sync_state WHERE folder_id = ?",
+        )
+        .bind(folder_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| FolderSyncState {
+            folder_id: r.0,
+            uidvalidity: r.1,
+            uidnext: r.2,
+            last_seen_uid: r.3,
+            last_sync_ts: r.4,
+            oldest_ts: r.5,
+        }))
+    }
+
+    pub async fn upsert_folder_sync_state(
+        &self,
+        state: &FolderSyncState,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO folder_sync_state
+             (folder_id, uidvalidity, uidnext, last_seen_uid, last_sync_ts, oldest_ts)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(folder_id) DO UPDATE SET
+               uidvalidity = excluded.uidvalidity,
+               uidnext = excluded.uidnext,
+               last_seen_uid = excluded.last_seen_uid,
+               last_sync_ts = excluded.last_sync_ts,
+               oldest_ts = excluded.oldest_ts",
+        )
+        .bind(state.folder_id)
+        .bind(state.uidvalidity)
+        .bind(state.uidnext)
+        .bind(state.last_seen_uid)
+        .bind(state.last_sync_ts)
+        .bind(state.oldest_ts)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn seed_demo_if_empty(&self) -> Result<()> {
@@ -426,9 +543,9 @@ impl SqliteMailStore {
 
         for (id, folder_id, date, from, subject, unread, preview) in messages {
             sqlx::query(
-                "INSERT INTO messages (id, account_id, folder_id, imap_uid, date, from_addr, subject, unread, preview)
-                 VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET folder_id = excluded.folder_id, date = excluded.date,
+                "INSERT INTO messages (id, account_id, folder_id, imap_uid, date, date_ts, from_addr, subject, unread, preview)
+                 VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET folder_id = excluded.folder_id, date = excluded.date, date_ts = excluded.date_ts,
                  from_addr = excluded.from_addr, subject = excluded.subject, unread = excluded.unread,
                  preview = excluded.preview",
             )
@@ -436,6 +553,7 @@ impl SqliteMailStore {
             .bind(folder_id)
             .bind(None::<i64>)
             .bind(date)
+            .bind(parse_date_ts(date))
             .bind(from)
             .bind(subject)
             .bind(unread)
@@ -640,7 +758,7 @@ impl MailStore for SqliteMailStore {
 
         let messages = sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, String, i64, String)>(
             "SELECT id, folder_id, imap_uid, date, from_addr, subject, unread, preview
-             FROM messages WHERE account_id = ? ORDER BY id",
+             FROM messages WHERE account_id = ? ORDER BY COALESCE(date_ts, 0) DESC, id DESC",
         )
         .bind(account_id)
         .fetch_all(&self.pool)

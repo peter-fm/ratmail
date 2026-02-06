@@ -20,7 +20,8 @@ use ratatui::{
 };
 
 use ratmail_core::{
-    Folder, MailStore, MessageDetail, MessageSummary, SqliteMailStore, StoreSnapshot, TileMeta,
+    Folder, FolderSyncState, MailStore, MessageDetail, MessageSummary, SqliteMailStore,
+    StoreSnapshot, TileMeta,
     DEFAULT_TEXT_WIDTH,
 };
 use ratmail_content::{extract_attachment_data, extract_attachments, extract_display, prepare_html};
@@ -92,12 +93,20 @@ struct RenderRequest {
 #[derive(Debug, Clone)]
 enum StoreUpdate {
     Folders { account_id: i64, folders: Vec<Folder> },
-    Messages {
+    AppendMessages {
         account_id: i64,
         folder_name: String,
         messages: Vec<MessageSummary>,
+        sync_update: Option<SyncUpdate>,
     },
     RawBody { account_id: i64, message_id: i64, raw: Vec<u8>, cached_text: Option<String> },
+}
+
+#[derive(Debug, Clone)]
+struct SyncUpdate {
+    last_seen_uid: Option<i64>,
+    oldest_ts: Option<i64>,
+    last_sync_ts: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -229,9 +238,11 @@ struct App {
     picker_cursor: usize,
     imap_enabled: bool,
     last_folder_sync: Option<(String, Instant)>,
+    last_backfill: Option<(String, Instant)>,
     imap_pending: usize,
     imap_spinner: usize,
     imap_status: Option<String>,
+    initial_sync_days: i64,
     compose_to: String,
     compose_cc: String,
     compose_bcc: String,
@@ -275,6 +286,7 @@ impl App {
         render_tile_height_px_side: i64,
         render_tile_height_px_focus: i64,
         imap_enabled: bool,
+        initial_sync_days: i64,
     ) -> Self {
         let mut app = Self {
             mode: Mode::List,
@@ -329,9 +341,11 @@ impl App {
             picker_cursor: 0,
             imap_enabled,
             last_folder_sync: None,
+            last_backfill: None,
             imap_pending: 0,
             imap_spinner: 0,
             imap_status: None,
+            initial_sync_days,
             compose_to: String::new(),
             compose_cc: String::new(),
             compose_bcc: String::new(),
@@ -398,7 +412,7 @@ impl App {
 
     fn visible_messages(&self) -> Vec<&MessageSummary> {
         let folder_id = self.selected_folder().map(|f| f.id);
-        let mut messages: Vec<&MessageSummary> = self.store
+        let messages: Vec<&MessageSummary> = self.store
             .messages
             .iter()
             .filter(|msg| Some(msg.folder_id) == folder_id)
@@ -407,11 +421,37 @@ impl App {
         messages
     }
 
+    fn restore_selection(&mut self, folder_name: Option<String>, message_uid: Option<u32>) {
+        if let Some(name) = folder_name {
+            if let Some(idx) = self.store.folders.iter().position(|f| f.name == name) {
+                self.folder_index = idx;
+            }
+        }
+        if let Some(uid) = message_uid {
+            let messages = self.visible_messages();
+            if let Some(idx) = messages
+                .iter()
+                .position(|m| m.imap_uid == Some(uid))
+            {
+                self.message_index = idx;
+            }
+        }
+        let max_folder = self.store.folders.len().saturating_sub(1);
+        if self.folder_index > max_folder {
+            self.folder_index = 0;
+        }
+        let max_msg = self.visible_messages().len().saturating_sub(1);
+        if self.message_index > max_msg {
+            self.message_index = 0;
+        }
+    }
+
     fn request_sync_selected_folder(&mut self) {
         if !self.imap_enabled {
             return;
         }
         let Some(folder) = self.selected_folder() else { return };
+        let folder_id = folder.id;
         let folder_name = folder.name.clone();
         let now = Instant::now();
         if let Some((name, last)) = &self.last_folder_sync {
@@ -422,8 +462,62 @@ impl App {
         self.last_folder_sync = Some((folder_name.clone(), now));
         self.imap_pending = self.imap_pending.saturating_add(1);
         self.imap_status = Some("IMAP syncing...".to_string());
+        let last_seen_uid = self.runtime().block_on(async {
+            self.store_handle
+                .get_folder_sync_state(folder_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.last_seen_uid)
+                .map(|v| v as u32)
+        });
+        let mode = match last_seen_uid {
+            Some(uid) => ratmail_mail::SyncMode::Incremental { last_seen_uid: uid },
+            None => ratmail_mail::SyncMode::Initial {
+                days: self.initial_sync_days,
+            },
+        };
         let _ = self.engine.send(MailCommand::SyncFolderByName {
             name: folder_name,
+            mode,
+        });
+    }
+
+    fn request_backfill_selected_folder(&mut self) {
+        if !self.imap_enabled {
+            return;
+        }
+        let Some(folder) = self.selected_folder() else { return };
+        let folder_id = folder.id;
+        let folder_name = folder.name.clone();
+        let now = Instant::now();
+        if let Some((name, last)) = &self.last_backfill {
+            if *name == folder_name && now.duration_since(*last) < Duration::from_secs(3) {
+                return;
+            }
+        }
+        self.last_backfill = Some((folder_name.clone(), now));
+        let oldest_ts = self.runtime().block_on(async {
+            self.store_handle
+                .get_folder_sync_state(folder_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.oldest_ts)
+        });
+        let Some(before_ts) = oldest_ts else {
+            self.status_message = Some("No older messages cached yet.".to_string());
+            return;
+        };
+        self.imap_pending = self.imap_pending.saturating_add(1);
+        self.imap_status = Some("IMAP loading older...".to_string());
+        let mode = ratmail_mail::SyncMode::Backfill {
+            before_ts,
+            window_days: self.initial_sync_days,
+        };
+        let _ = self.engine.send(MailCommand::SyncFolderByName {
+            name: folder_name,
+            mode,
         });
     }
 
@@ -953,10 +1047,12 @@ impl App {
                         preview: m.preview,
                     })
                     .collect();
-                let _ = self.store_update_tx.send(StoreUpdate::Messages {
+                let sync_update = build_sync_update(&items);
+                let _ = self.store_update_tx.send(StoreUpdate::AppendMessages {
                     account_id,
                     folder_name,
                     messages: items,
+                    sync_update,
                 });
                 self.prefetch_raw_bodies(10);
             }
@@ -1023,6 +1119,9 @@ impl App {
                                 self.ensure_text_cache_for_selected();
                             } else {
                                 self.ensure_text_cache_for_selected();
+                            }
+                            if self.message_index + 1 == count {
+                                self.request_backfill_selected_folder();
                             }
                         }
                     }
@@ -1149,6 +1248,9 @@ impl App {
             (KeyCode::Char('c'), _) => {
                 self.start_compose_new();
             }
+            (KeyCode::Char('o'), _) => {
+                self.request_backfill_selected_folder();
+            }
             _ => {}
         }
         false
@@ -1222,6 +1324,9 @@ impl App {
             }
             (KeyCode::Char('f'), _) => {
                 self.start_compose_forward();
+            }
+            (KeyCode::Char('o'), _) => {
+                self.request_backfill_selected_folder();
             }
             (KeyCode::Esc, _) => {
                 self.mode = Mode::View;
@@ -1917,6 +2022,31 @@ fn apply_input_key(target: &mut String, cursor: &mut usize, key: KeyEvent) -> bo
     false
 }
 
+fn build_sync_update(items: &[MessageSummary]) -> Option<SyncUpdate> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut last_seen_uid: Option<i64> = None;
+    let mut oldest_ts: Option<i64> = None;
+    for item in items {
+        if let Some(uid) = item.imap_uid.map(|v| v as i64) {
+            last_seen_uid = Some(last_seen_uid.map_or(uid, |prev| prev.max(uid)));
+        }
+        if let Ok(ts) = mailparse::dateparse(&item.date) {
+            oldest_ts = Some(oldest_ts.map_or(ts, |prev| prev.min(ts)));
+        }
+    }
+    let last_sync_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some(SyncUpdate {
+        last_seen_uid,
+        oldest_ts,
+        last_sync_ts,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectionKey {
     Up,
@@ -2279,10 +2409,11 @@ fn main() -> Result<()> {
                             };
                             store_for_task.load_snapshot(account_id, folder_id).await
                         }
-                    StoreUpdate::Messages {
+                    StoreUpdate::AppendMessages {
                         account_id,
                         folder_name,
                         messages,
+                        sync_update,
                     } => {
                         let mut folder_id = store_for_task
                             .folder_id_by_name(account_id, &folder_name)
@@ -2308,8 +2439,40 @@ fn main() -> Result<()> {
                                 })
                                 .collect();
                             store_for_task
-                                .replace_folder_messages(account_id, folder_id, &items)
+                                .upsert_folder_messages_append(account_id, folder_id, &items)
                                 .await?;
+                            if let Some(update) = sync_update {
+                                let existing = store_for_task
+                                    .get_folder_sync_state(folder_id)
+                                    .await?
+                                    .unwrap_or(FolderSyncState {
+                                        folder_id,
+                                        uidvalidity: None,
+                                        uidnext: None,
+                                        last_seen_uid: None,
+                                        last_sync_ts: None,
+                                        oldest_ts: None,
+                                    });
+                                let merged = FolderSyncState {
+                                    folder_id,
+                                    uidvalidity: existing.uidvalidity,
+                                    uidnext: existing.uidnext,
+                                    last_seen_uid: match (existing.last_seen_uid, update.last_seen_uid) {
+                                        (Some(a), Some(b)) => Some(a.max(b)),
+                                        (Some(a), None) => Some(a),
+                                        (None, Some(b)) => Some(b),
+                                        (None, None) => None,
+                                    },
+                                    last_sync_ts: Some(update.last_sync_ts),
+                                    oldest_ts: match (existing.oldest_ts, update.oldest_ts) {
+                                        (Some(a), Some(b)) => Some(a.min(b)),
+                                        (Some(a), None) => Some(a),
+                                        (None, Some(b)) => Some(b),
+                                        (None, None) => None,
+                                    },
+                                };
+                                store_for_task.upsert_folder_sync_state(&merged).await?;
+                            }
                             log_debug(&format!(
                                 "store_update messages folder={} id={} count={}",
                                 folder_name,
@@ -2432,6 +2595,7 @@ fn main() -> Result<()> {
         renderer_for_worker,
     ));
 
+    let initial_sync_days = imap.as_ref().map(|i| i.initial_sync_days).unwrap_or(90);
     let res = run_app(
         &mut terminal,
         App::new(
@@ -2452,6 +2616,7 @@ fn main() -> Result<()> {
             render_tile_height_px_side,
             render_tile_height_px_focus,
             imap.is_some(),
+            initial_sync_days,
         ),
     );
 
@@ -2470,8 +2635,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> R
             app.on_event(event);
         }
         while let Ok(snapshot) = app.store_updates.try_recv() {
+            let prev_folder = app.selected_folder().map(|f| f.name.clone());
+            let prev_uid = app.selected_message().and_then(|m| m.imap_uid);
             app.store = snapshot;
-            app.select_inbox_if_available();
+            app.restore_selection(prev_folder, prev_uid);
+            if app.store.folders.is_empty() {
+                app.select_inbox_if_available();
+            }
         }
         while let Ok(event) = app.render_events.try_recv() {
             app.on_render_event(event);
@@ -2569,18 +2739,24 @@ fn render_main(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 }
 
 fn render_folders(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let items: Vec<Line> = app
-        .store
-        .folders
+    let total = app.store.folders.len();
+    let rows_visible = area.height.saturating_sub(1).max(1) as usize;
+    let mut start = app.folder_index.saturating_sub(rows_visible.saturating_sub(1));
+    if start + rows_visible > total {
+        start = total.saturating_sub(rows_visible);
+    }
+    let end = (start + rows_visible).min(total);
+    let items: Vec<Line> = app.store.folders[start..end]
         .iter()
         .enumerate()
         .map(|(idx, folder)| {
+            let global_idx = start + idx;
             let label = if folder.unread > 0 {
                 format!("{}  {}", folder.name, folder.unread)
             } else {
                 folder.name.clone()
             };
-            let style = if idx == app.folder_index {
+            let style = if global_idx == app.folder_index {
                 if app.focus == Focus::Folders {
                     Style::default().bg(Color::DarkGray)
                 } else {
@@ -2606,12 +2782,20 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     );
 
     let visible = app.visible_messages();
-    let rows: Vec<Row> = visible
+    let total = visible.len();
+    let rows_visible = area.height.saturating_sub(2).max(1) as usize;
+    let mut start = app.message_index.saturating_sub(rows_visible.saturating_sub(1));
+    if start + rows_visible > total {
+        start = total.saturating_sub(rows_visible);
+    }
+    let end = (start + rows_visible).min(total);
+    let rows: Vec<Row> = visible[start..end]
         .iter()
         .enumerate()
         .map(|(idx, message)| {
+            let global_idx = start + idx;
             let unread = if message.unread { "*" } else { " " };
-            let style = if idx == app.message_index {
+            let style = if global_idx == app.message_index {
                 if app.focus == Focus::Messages {
                     Style::default().bg(Color::DarkGray)
                 } else {
@@ -2620,7 +2804,13 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             } else {
                 Style::default()
             };
-            Row::new(vec![unread, message.date.as_str(), &message.from, &message.subject])
+            let from_display = format_from_display(&message.from);
+            Row::new(vec![
+                unread.to_string(),
+                message.date.clone(),
+                from_display,
+                message.subject.clone(),
+            ])
                 .style(style)
         })
         .collect();
@@ -2656,6 +2846,22 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(msg), hint_area);
     }
 
+}
+
+fn format_from_display(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('<'), trimmed.find('>')) {
+        let name = trimmed[..start].trim().trim_matches('"').trim();
+        let email = trimmed[start + 1..end].trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+        return email.to_string();
+    }
+    trimmed.to_string()
 }
 
 fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, scroll: u16) {
@@ -3281,6 +3487,16 @@ fn load_imap_config() -> Option<ImapConfig> {
             .get("skip_tls_verify")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        initial_sync_days: imap
+            .get("initial_sync_days")
+            .and_then(|v| v.as_integer())
+            .map(|v| v.max(1) as i64)
+            .unwrap_or(90),
+        fetch_chunk_size: imap
+            .get("fetch_chunk_size")
+            .and_then(|v| v.as_integer())
+            .map(|v| v.clamp(1, 50) as usize)
+            .unwrap_or(10),
     })
 }
 
