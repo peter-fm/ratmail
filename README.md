@@ -11,10 +11,10 @@ Terminal email client with dual-channel viewing (rendered HTML + high-quality te
 
 ## Getting started
 
-1. Install from crates.io:
+1. Install from GitHub:
 
 ```bash
-cargo install ratmail
+cargo install --git https://github.com/peter-fm/ratmail.git --locked
 ```
 
 2. Create config:
@@ -41,12 +41,6 @@ Or use the workspace alias:
 
 ```bash
 cargo run-ratmail
-```
-
-## Install (from crates.io)
-
-```bash
-cargo install ratmail
 ```
 
 ## Install (from GitHub)
