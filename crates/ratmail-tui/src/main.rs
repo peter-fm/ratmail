@@ -30,6 +30,9 @@ use mailparse::{addrparse_header, MailAddr, MailHeaderMap};
 use std::sync::Arc;
 use ratatui_image::{picker::Picker, protocol::ImageSource, protocol::Protocol, protocol::StatefulProtocol, Image, Resize, StatefulImage};
 use mime_guess::MimeGuess;
+use ratatui_explorer::{FileExplorer, Input as ExplorerInput, Theme as ExplorerTheme};
+use zip::{write::FileOptions, ZipWriter};
+use std::io::Cursor;
 
 const TICK_RATE: Duration = Duration::from_millis(200);
 const PROTOCOL_CACHE_LIMIT: usize = 16;
@@ -117,13 +120,19 @@ enum Mode {
 }
 
 #[derive(Debug, Clone)]
-enum InputMode {
-    SaveAttachment {
+enum PickerMode {
+    Attach,
+    Save {
         message_id: i64,
         attachment_index: usize,
         filename: String,
     },
-    AddComposeAttachment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerFocus {
+    Explorer,
+    Filename,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,9 +222,11 @@ struct App {
     link_index: usize,
     attach_index: usize,
     status_message: Option<String>,
-    input_mode: Option<InputMode>,
-    input_buffer: String,
-    input_cursor: usize,
+    picker_mode: Option<PickerMode>,
+    picker_focus: PickerFocus,
+    picker: Option<FileExplorer>,
+    picker_filename: String,
+    picker_cursor: usize,
     imap_enabled: bool,
     last_folder_sync: Option<(String, Instant)>,
     imap_pending: usize,
@@ -311,9 +322,11 @@ impl App {
             link_index: 0,
             attach_index: 0,
             status_message: None,
-            input_mode: None,
-            input_buffer: String::new(),
-            input_cursor: 0,
+            picker_mode: None,
+            picker_focus: PickerFocus::Explorer,
+            picker: None,
+            picker_filename: String::new(),
+            picker_cursor: 0,
             imap_enabled,
             last_folder_sync: None,
             imap_pending: 0,
@@ -416,8 +429,8 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
-        if self.input_mode.is_some() {
-            return self.on_key_input(key);
+        if self.picker_mode.is_some() {
+            return self.on_key_picker(key);
         }
         match self.mode {
             Mode::List | Mode::View => self.on_key_main(key),
@@ -1296,7 +1309,7 @@ impl App {
     fn on_key_compose(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A')) {
-            self.start_input(InputMode::AddComposeAttachment, String::new());
+            self.start_picker(PickerMode::Attach);
             return false;
         }
         if ctrl && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
@@ -1500,81 +1513,178 @@ impl App {
         false
     }
 
-    fn on_key_input(&mut self, key: KeyEvent) -> bool {
+    fn on_key_picker(&mut self, key: KeyEvent) -> bool {
+        let Some(mode) = self.picker_mode.clone() else { return false };
         match key.code {
             KeyCode::Esc => {
-                self.input_mode = None;
-                self.input_buffer.clear();
-                self.input_cursor = 0;
-                self.status_message = Some("Canceled".to_string());
+                self.close_picker("Canceled");
+                return false;
             }
-            KeyCode::Enter => {
-                self.submit_input();
+            KeyCode::Tab => {
+                if matches!(mode, PickerMode::Save { .. }) {
+                    self.picker_focus = match self.picker_focus {
+                        PickerFocus::Explorer => PickerFocus::Filename,
+                        PickerFocus::Filename => PickerFocus::Explorer,
+                    };
+                }
+                return false;
             }
-            KeyCode::Left => move_cursor_left(&self.input_buffer, &mut self.input_cursor),
-            KeyCode::Right => move_cursor_right(&self.input_buffer, &mut self.input_cursor),
-            _ => {
-                apply_input_key(&mut self.input_buffer, &mut self.input_cursor, key);
+            _ => {}
+        }
+
+        match self.picker_focus {
+            PickerFocus::Explorer => {
+                if key.code == KeyCode::Enter {
+                    match mode {
+                        PickerMode::Attach => {
+                            self.confirm_attach_selection();
+                        }
+                        PickerMode::Save { .. } => {
+                            if let Some(current) = self.picker.as_ref().map(|p| p.current()) {
+                                if current.is_file() {
+                                    self.picker_filename = current.name().to_string();
+                                    self.picker_cursor = text_char_len(&self.picker_filename);
+                                }
+                            }
+                            self.picker_focus = PickerFocus::Filename;
+                        }
+                    }
+                    return false;
+                }
+                self.handle_picker_navigation(key);
             }
+            PickerFocus::Filename => match key.code {
+                KeyCode::Enter => {
+                    if let PickerMode::Save {
+                        message_id,
+                        attachment_index,
+                        filename,
+                    } = mode
+                    {
+                        let mut name = self.picker_filename.trim().to_string();
+                        if name.is_empty() {
+                            name = filename;
+                        }
+                        if let Some(dir) = self.picker_selected_dir() {
+                            let target = dir.join(name);
+                            match self.save_attachment_to_path(
+                                message_id,
+                                attachment_index,
+                                &target,
+                            ) {
+                                Ok(path) => {
+                                    self.close_picker(&format!(
+                                        "Saved attachment to {}",
+                                        path.display()
+                                    ));
+                                }
+                                Err(err) => {
+                                    if err.to_string() != "message body not cached" {
+                                        self.status_message =
+                                            Some(format!("Save failed: {}", err));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                KeyCode::Left => move_cursor_left(&self.picker_filename, &mut self.picker_cursor),
+                KeyCode::Right => {
+                    move_cursor_right(&self.picker_filename, &mut self.picker_cursor)
+                }
+                _ => {
+                    apply_input_key(&mut self.picker_filename, &mut self.picker_cursor, key);
+                }
+            },
         }
         false
     }
 
-    fn start_input(&mut self, mode: InputMode, initial: String) {
-        self.input_mode = Some(mode);
-        self.input_buffer = initial;
-        self.input_cursor = text_char_len(&self.input_buffer);
+    fn start_picker(&mut self, mode: PickerMode) {
+        let theme = ExplorerTheme::default()
+            .with_block(Block::default().borders(Borders::ALL))
+            .add_default_title();
+        let mut picker = match FileExplorer::with_theme(theme) {
+            Ok(picker) => picker,
+            Err(err) => {
+                self.status_message = Some(format!("Picker error: {}", err));
+                return;
+            }
+        };
+        if let Ok(home) = std::env::var("HOME") {
+            let _ = picker.set_cwd(home);
+        }
+        self.picker = Some(picker);
+        self.picker_mode = Some(mode);
+        self.picker_focus = PickerFocus::Explorer;
+        self.picker_filename.clear();
+        self.picker_cursor = 0;
+        if let Some(PickerMode::Save { filename, .. }) = &self.picker_mode {
+            self.picker_filename = filename.clone();
+            self.picker_cursor = text_char_len(&self.picker_filename);
+        }
     }
 
-    fn submit_input(&mut self) {
-        let mode = self.input_mode.clone();
-        self.input_mode = None;
-        let buffer = self.input_buffer.trim().to_string();
-        self.input_buffer.clear();
-        self.input_cursor = 0;
+    fn close_picker(&mut self, status: &str) {
+        self.picker_mode = None;
+        self.picker = None;
+        self.picker_filename.clear();
+        self.picker_cursor = 0;
+        self.picker_focus = PickerFocus::Explorer;
+        self.status_message = Some(status.to_string());
+    }
 
-        match mode {
-            Some(InputMode::AddComposeAttachment) => {
-                if buffer.is_empty() {
-                    self.status_message = Some("Attachment path required".to_string());
-                    return;
-                }
-                let path = expand_tilde(&buffer);
-                match self.add_compose_attachment_from_path(Path::new(&path)) {
-                    Ok(added) => {
-                        self.status_message = Some(format!(
-                            "Attached {} ({})",
-                            added.filename,
-                            format_size(added.size)
-                        ));
-                    }
-                    Err(err) => {
-                        self.status_message = Some(format!("Attach failed: {}", err));
-                    }
+    fn handle_picker_navigation(&mut self, key: KeyEvent) {
+        let Some(picker) = self.picker.as_mut() else { return };
+        let input = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => ExplorerInput::Down,
+            KeyCode::Char('k') | KeyCode::Up => ExplorerInput::Up,
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    ExplorerInput::ToggleShowHidden
+                } else {
+                    ExplorerInput::Left
                 }
             }
-            Some(InputMode::SaveAttachment {
-                message_id,
-                attachment_index,
-                filename,
-            }) => {
-                let target = if buffer.is_empty() { filename } else { buffer };
-                let path = expand_tilde(&target);
-                match self.save_attachment_to_path(message_id, attachment_index, Path::new(&path)) {
-                    Ok(path) => {
-                        self.status_message = Some(format!(
-                            "Saved attachment to {}",
-                            path.display()
-                        ));
-                    }
-                    Err(err) => {
-                        if err.to_string() != "message body not cached" {
-                            self.status_message = Some(format!("Save failed: {}", err));
-                        }
-                    }
-                }
+            KeyCode::Char('l') | KeyCode::Right => ExplorerInput::Right,
+            KeyCode::Home => ExplorerInput::Home,
+            KeyCode::End => ExplorerInput::End,
+            KeyCode::PageUp => ExplorerInput::PageUp,
+            KeyCode::PageDown => ExplorerInput::PageDown,
+            _ => ExplorerInput::None,
+        };
+        if input != ExplorerInput::None {
+            let _ = picker.handle(input);
+        }
+    }
+
+    fn picker_selected_dir(&self) -> Option<PathBuf> {
+        let picker = self.picker.as_ref()?;
+        let current = picker.current();
+        if current.is_dir() {
+            return Some(current.path().clone());
+        }
+        current
+            .path()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .or_else(|| Some(picker.cwd().clone()))
+    }
+
+    fn confirm_attach_selection(&mut self) {
+        let Some(picker) = self.picker.as_ref() else { return };
+        let target = picker.current().path().clone();
+        match self.add_compose_attachment_from_path(&target) {
+            Ok(added) => {
+                self.close_picker(&format!(
+                    "Attached {} ({})",
+                    added.filename,
+                    format_size(added.size)
+                ));
             }
-            None => {}
+            Err(err) => {
+                self.status_message = Some(format!("Attach failed: {}", err));
+            }
         }
     }
 
@@ -1605,20 +1715,27 @@ impl App {
         }
         let filename = detail.attachments[self.attach_index].filename.clone();
         let message_id = detail.id;
-        self.start_input(
-            InputMode::SaveAttachment {
-                message_id,
-                attachment_index: self.attach_index,
-                filename: filename.clone(),
-            },
+        self.start_picker(PickerMode::Save {
+            message_id,
+            attachment_index: self.attach_index,
             filename,
-        );
+        });
     }
 
     fn add_compose_attachment_from_path(&mut self, path: &Path) -> Result<ComposeAttachment> {
         if !path.exists() {
             return Err(anyhow::anyhow!("file not found"));
         }
+        let attachment = if path.is_dir() {
+            self.build_zip_attachment(path)?
+        } else {
+            self.build_file_attachment(path)?
+        };
+        self.compose_attachments.push(attachment.clone());
+        Ok(attachment)
+    }
+
+    fn build_file_attachment(&self, path: &Path) -> Result<ComposeAttachment> {
         let filename = path
             .file_name()
             .and_then(|f| f.to_str())
@@ -1630,14 +1747,29 @@ impl App {
             .first_or_octet_stream()
             .essence_str()
             .to_string();
-        let attachment = ComposeAttachment {
+        Ok(ComposeAttachment {
             filename,
             mime,
             size,
             data,
-        };
-        self.compose_attachments.push(attachment.clone());
-        Ok(attachment)
+        })
+    }
+
+    fn build_zip_attachment(&self, path: &Path) -> Result<ComposeAttachment> {
+        let folder = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let filename = format!("{}.zip", folder);
+        let data = zip_directory(path)?;
+        let size = data.len();
+        Ok(ComposeAttachment {
+            filename,
+            mime: "application/zip".to_string(),
+            size,
+            data,
+        })
     }
 
     fn save_attachment_to_temp(
@@ -2386,8 +2518,8 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         _ => {}
     }
 
-    if app.input_mode.is_some() {
-        render_input_overlay(frame, area, app);
+    if app.picker_mode.is_some() {
+        render_picker_overlay(frame, area, app);
     }
 }
 
@@ -2823,28 +2955,68 @@ fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) 
     frame.render_widget(paragraph, popup);
 }
 
-fn render_input_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
-    let Some(mode) = &app.input_mode else { return };
-    let popup = centered_rect(70, 20, area);
+fn render_picker_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Some(mode) = &app.picker_mode else { return };
+    let Some(picker) = &app.picker else { return };
+    let popup = centered_rect(85, 85, area);
     frame.render_widget(Clear, popup);
-    let block = Block::default().borders(Borders::ALL).title("INPUT");
+
+    let title = match mode {
+        PickerMode::Attach => "ATTACH FILE",
+        PickerMode::Save { .. } => "SAVE ATTACHMENT",
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let prompt = match mode {
-        InputMode::SaveAttachment { .. } => "Save attachment as: ",
-        InputMode::AddComposeAttachment => "Attach file path: ",
-    };
-    let line = format!("{}{}", prompt, app.input_buffer);
-    let help = "Enter confirm  Esc cancel";
-    let text = Text::from(vec![Line::from(line), Line::from(""), Line::from(help)]);
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .split(inner);
 
-    let prompt_len = prompt.chars().count() as u16;
-    let cursor_col = prompt_len.saturating_add(app.input_cursor as u16);
-    let x = inner.x + cursor_col.min(inner.width.saturating_sub(1));
-    let y = inner.y;
-    frame.set_cursor_position((x, y));
+    let widget = picker.widget();
+    frame.render_widget(widget, rows[0]);
+
+    let mut lines = Vec::new();
+    match mode {
+        PickerMode::Attach => {
+            lines.push(Line::from(
+                "Enter attach  Right/L enter dir  Left/Back parent  Ctrl+H toggle hidden  Esc cancel",
+            ));
+        }
+        PickerMode::Save { filename, .. } => {
+            let dir = app
+                .picker_selected_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| "(unknown)".to_string());
+            lines.push(Line::from(format!("Directory: {}", dir)));
+            let label = if app.picker_focus == PickerFocus::Filename {
+                "Filename*:"
+            } else {
+                "Filename :"
+            };
+            let display = if app.picker_filename.is_empty() {
+                filename.clone()
+            } else {
+                app.picker_filename.clone()
+            };
+            lines.push(Line::from(format!("{} {}", label, display)));
+            lines.push(Line::from(
+                "Tab focus  Enter save  Right/L enter dir  Left/Back parent  Esc cancel",
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), rows[1]);
+
+    if matches!(mode, PickerMode::Save { .. })
+        && app.picker_focus == PickerFocus::Filename
+    {
+        let label_len = "Filename*: ".chars().count() as u16;
+        let cursor_col = label_len.saturating_add(app.picker_cursor as u16);
+        let x = rows[1].x + cursor_col.min(rows[1].width.saturating_sub(1));
+        let y = rows[1].y + 1;
+        frame.set_cursor_position((x, y));
+    }
 }
 
 fn format_size(bytes: usize) -> String {
@@ -2857,21 +3029,62 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
-fn expand_tilde(input: &str) -> String {
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return Path::new(&home).join(rest).to_string_lossy().to_string();
-        }
-    }
-    input.to_string()
-}
-
 fn safe_filename(input: &str) -> String {
     Path::new(input)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("attachment")
         .to_string()
+}
+
+fn zip_directory(dir: &Path) -> Result<Vec<u8>> {
+    let base_parent = dir.parent().unwrap_or(dir);
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut cursor);
+        let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let root = dir
+            .strip_prefix(base_parent)
+            .unwrap_or(dir)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !root.is_empty() {
+            let name = if root.ends_with('/') { root } else { format!("{}/", root) };
+            zip.add_directory(name, options)?;
+        }
+        add_dir_to_zip(&mut zip, base_parent, dir, options)?;
+        zip.finish()?;
+    }
+    Ok(cursor.into_inner())
+}
+
+fn add_dir_to_zip(
+    zip: &mut ZipWriter<&mut Cursor<Vec<u8>>>,
+    base_parent: &Path,
+    dir: &Path,
+    options: FileOptions,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(base_parent)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if path.is_dir() {
+            let name = if rel.ends_with('/') { rel } else { format!("{}/", rel) };
+            if !name.is_empty() {
+                zip.add_directory(name, options)?;
+            }
+            add_dir_to_zip(zip, base_parent, &path, options)?;
+        } else {
+            zip.start_file(rel, options)?;
+            let data = std::fs::read(&path)?;
+            zip.write_all(&data)?;
+        }
+    }
+    Ok(())
 }
 
 fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {

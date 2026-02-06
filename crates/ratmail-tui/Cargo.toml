@@ -20,6 +20,8 @@ open.workspace = true
 toml.workspace = true
 mailparse.workspace = true
 mime_guess.workspace = true
+zip.workspace = true
+ratatui-explorer = { path = "../ratatui-explorer" }
 
 [[bin]]
 name = "ratmail"
