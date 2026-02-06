@@ -437,15 +437,37 @@ impl App {
             "Trash",
         ];
         self.store.folders.sort_by(|a, b| {
-            let a_idx = PRIORITY.iter().position(|p| p == &a.name);
-            let b_idx = PRIORITY.iter().position(|p| p == &b.name);
+            let a_name = canonical_folder_name(&a.name);
+            let b_name = canonical_folder_name(&b.name);
+            let a_idx = PRIORITY.iter().position(|p| p == &a_name);
+            let b_idx = PRIORITY.iter().position(|p| p == &b_name);
             match (a_idx, b_idx) {
                 (Some(ai), Some(bi)) => ai.cmp(&bi),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.name.cmp(&b.name),
+                (None, None) => a_name.cmp(&b_name),
             }
         });
+        let mut seen = HashSet::new();
+        let system: HashSet<&'static str> =
+            ["All Mail", "INBOX", "Starred", "Sent", "Drafts", "Archive", "Spam", "Trash"]
+                .into_iter()
+                .collect();
+        self.store.folders.retain(|f| {
+            let canonical = canonical_folder_name(&f.name);
+            if !system.contains(canonical.as_str()) {
+                return true;
+            }
+            if seen.contains(&canonical) {
+                return false;
+            }
+            seen.insert(canonical);
+            true
+        });
+    }
+
+    fn display_folder_name(raw: &str) -> String {
+        canonical_folder_name(raw)
     }
 
     fn restore_selection(&mut self, folder_name: Option<String>, message_uid: Option<u32>) {
@@ -2802,10 +2824,11 @@ fn render_folders(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(idx, folder)| {
             let global_idx = start + idx;
+            let display_name = App::display_folder_name(&folder.name);
             let label = if folder.unread > 0 {
-                format!("{}  {}", folder.name, folder.unread)
+                format!("{}  {}", display_name, folder.unread)
             } else {
-                folder.name.clone()
+                display_name
             };
             let style = if global_idx == app.folder_index {
                 if app.focus == Focus::Folders {
@@ -2913,6 +2936,28 @@ fn format_from_display(raw: &str) -> String {
         return email.to_string();
     }
     trimmed.to_string()
+}
+
+fn canonical_folder_name(raw: &str) -> String {
+    let mut name = raw.trim();
+    if let Some(stripped) = name.strip_prefix("[Gmail]/") {
+        name = stripped;
+    } else if let Some(stripped) = name.strip_prefix("[Google Mail]/") {
+        name = stripped;
+    }
+    let lowered = name.trim().to_lowercase();
+    let mapped = match lowered.as_str() {
+        "sent mail" | "sent-mail" => "Sent",
+        "all mail" => "All Mail",
+        "inbox" => "INBOX",
+        "drafts" => "Drafts",
+        "archive" => "Archive",
+        "spam" => "Spam",
+        "trash" => "Trash",
+        "starred" => "Starred",
+        _ => name.trim(),
+    };
+    mapped.to_string()
 }
 
 fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, scroll: u16) {

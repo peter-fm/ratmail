@@ -9,7 +9,6 @@ use lettre::{
 use mailparse::{addrparse, MailAddr};
 use imap::{ClientBuilder, ConnectionMode};
 use chrono::{Datelike, Duration, Local, TimeZone};
-use imap_proto::types::Address as ProtoAddress;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
@@ -608,45 +607,6 @@ fn fetch_imap_body(imap: &ImapConfig, folder: &str, uid: u32) -> Result<Vec<u8>>
     Ok(body)
 }
 
-fn format_imap_address(addr: &ProtoAddress) -> String {
-    let name = addr
-        .name
-        .as_ref()
-        .map(|s| decode_header_value(s))
-        .unwrap_or_default();
-    let mailbox = addr
-        .mailbox
-        .as_ref()
-        .map(|s| String::from_utf8_lossy(s).to_string())
-        .unwrap_or_default();
-    let host = addr
-        .host
-        .as_ref()
-        .map(|s| String::from_utf8_lossy(s).to_string())
-        .unwrap_or_default();
-    let email = if mailbox.is_empty() || host.is_empty() {
-        String::new()
-    } else {
-        format!("{}@{}", mailbox, host)
-    };
-    if !name.is_empty() && !email.is_empty() {
-        format!("{} <{}>", name, email)
-    } else if !email.is_empty() {
-        email
-    } else {
-        name
-    }
-}
-
-fn decode_header_value(raw: &[u8]) -> String {
-    let mut buf = Vec::with_capacity(raw.len() + 3);
-    buf.extend_from_slice(b"X: ");
-    buf.extend_from_slice(raw);
-    match mailparse::parse_header(&buf) {
-        Ok((header, _)) => header.get_value(),
-        Err(_) => String::from_utf8_lossy(raw).to_string(),
-    }
-}
 
 fn header_value(raw: &[u8], name: &str) -> Option<String> {
     let (headers, _) = mailparse::parse_headers(raw).ok()?;
