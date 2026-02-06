@@ -6,6 +6,7 @@ use base64::Engine;
 use headless_chrome::{Browser, LaunchOptionsBuilder};
 use image::{imageops::crop_imm, DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgba};
 use std::io::Cursor;
+use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 use ratmail_core::TileMeta;
@@ -146,6 +147,29 @@ img{{max-width:100%; height:auto;}}\
             // Data URLs sometimes don't emit the navigation event expected by wait_until_navigated.
             // Waiting for the body element is sufficient for our static HTML rendering.
             tab.wait_for_element("body")?;
+            // Give images a moment to load so the screenshot captures them.
+            // This is especially important for remote images and slower connections.
+            let wait_ms = std::env::var("RATMAIL_RENDER_WAIT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(750);
+            if wait_ms > 0 {
+                let deadline = Instant::now() + Duration::from_millis(wait_ms);
+                loop {
+                    let loaded = tab
+                        .evaluate(
+                            "Array.from(document.images).every(img => img.complete)",
+                            false,
+                        )?
+                        .value
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if loaded || Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
             let png = {
                 use headless_chrome::protocol::cdp::Page;
                 let data = tab
