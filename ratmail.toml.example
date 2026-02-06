@@ -26,5 +26,6 @@ fetch_chunk_size = 10
 [render]
 remote_images = false
 width_px = 1000
+render_scale = 1.0
 tile_height_px_side = 5000
 tile_height_px_focus = 120

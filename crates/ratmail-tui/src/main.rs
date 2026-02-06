@@ -27,6 +27,7 @@ use ratmail_core::{
 use ratmail_content::{extract_attachment_data, extract_attachments, extract_display, prepare_html};
 use ratmail_mail::{ImapConfig, MailCommand, MailEngine, MailEvent, OutgoingAttachment, SmtpConfig};
 use ratmail_render::{detect_image_support, ChromiumRenderer, NullRenderer, RemotePolicy, Renderer};
+use image::GenericImageView;
 use mailparse::{addrparse_header, MailAddr, MailHeaderMap};
 use std::sync::Arc;
 use ratatui_image::{picker::Picker, protocol::ImageSource, protocol::Protocol, protocol::StatefulProtocol, Image, Resize, StatefulImage};
@@ -228,6 +229,7 @@ struct App {
     render_tile_height_px: i64,
     render_tile_height_px_focus: i64,
     render_tile_height_px_side: i64,
+    render_scale: f64,
     show_preview: bool,
     show_help: bool,
     link_index: usize,
@@ -343,6 +345,7 @@ impl App {
         render_tile_height_px_focus: i64,
         imap_enabled: bool,
         initial_sync_days: i64,
+        render_scale: f64,
     ) -> Self {
         let mut app = Self {
             mode: Mode::List,
@@ -387,6 +390,7 @@ impl App {
             render_tile_height_px: render_tile_height_px_side,
             render_tile_height_px_focus,
             render_tile_height_px_side,
+            render_scale,
             show_preview: false,
             show_help: false,
             link_index: 0,
@@ -2498,6 +2502,11 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(render_config.width_px);
+    let render_scale = std::env::var("RATMAIL_RENDER_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(render_config.render_scale)
+        .clamp(0.25, 4.0);
     let render_tile_height_px_side = std::env::var("RATMAIL_RENDER_TILE_HEIGHT_PX_SIDE")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
@@ -2753,6 +2762,7 @@ fn main() -> Result<()> {
             render_tile_height_px_focus,
             account.imap.is_some(),
             initial_sync_days,
+            render_scale,
         );
         apps.push(app);
     }
@@ -2772,7 +2782,7 @@ fn main() -> Result<()> {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut multi: MultiApp,
-    rt: Arc<tokio::runtime::Runtime>,
+    _rt: Arc<tokio::runtime::Runtime>,
 ) -> Result<()> {
     loop {
         terminal.draw(|frame| ui(frame, &mut multi))?;
@@ -3058,6 +3068,21 @@ fn canonical_folder_name(raw: &str) -> String {
     mapped.to_string()
 }
 
+fn scale_image(img: image::DynamicImage, scale: f64) -> image::DynamicImage {
+    if (scale - 1.0).abs() < 0.01 {
+        return img;
+    }
+    let (w, h) = img.dimensions();
+    let new_w = ((w as f64) * scale).round().max(1.0) as u32;
+    let new_h = ((h as f64) * scale).round().max(1.0) as u32;
+    image::DynamicImage::ImageRgba8(image::imageops::resize(
+        &img,
+        new_w,
+        new_h,
+        image::imageops::FilterType::Lanczos3,
+    ))
+}
+
 fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, scroll: u16) {
     let detail = app.selected_detail().cloned();
     let view_mode = app.view_mode;
@@ -3161,8 +3186,9 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                     .as_ref()
                     .map(|p| p.font_size())
                     .unwrap_or((10, 20));
-                let tile_rows = (app.render_tile_height_px / fh as i64)
-                    .max(1) as u16;
+                let tile_rows = ((app.render_tile_height_px as f64 * app.render_scale) / fh as f64)
+                    .ceil()
+                    .max(1.0) as u16;
 
                 let mut y = content_area.y;
                 let end_y = content_area.y + content_area.height;
@@ -3183,6 +3209,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                         if let Some(bytes) = app.render_tiles.get(idx).map(|t| t.bytes.clone()) {
                             if let Ok(img) = image::load_from_memory(&bytes) {
                                 if let Some(picker) = app.image_picker.as_mut() {
+                                    let img = scale_image(img, app.render_scale);
                                     let source = ImageSource::new(
                                         img.clone(),
                                         picker.font_size(),
@@ -3214,6 +3241,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                     } else if let Some(bytes) = app.render_tiles.get(desired_idx).map(|t| t.bytes.clone()) {
                         if let Ok(img) = image::load_from_memory(&bytes) {
                             if let Some(picker) = app.image_picker.as_mut() {
+                                let img = scale_image(img, app.render_scale);
                                 let protocol = picker.new_resize_protocol(img);
                                 app.render_tile_index = desired_idx;
                                 app.store_protocol_cache(message_id, desired_idx, protocol);
@@ -3785,6 +3813,7 @@ fn slugify_name(raw: &str) -> String {
 struct RenderConfig {
     allow_remote_images: bool,
     width_px: i64,
+    render_scale: f64,
     tile_height_px_side: i64,
     tile_height_px_focus: i64,
 }
@@ -3797,6 +3826,7 @@ fn load_render_config() -> RenderConfig {
             return RenderConfig {
                 allow_remote_images: false,
                 width_px: 1000,
+                render_scale: 1.0,
                 tile_height_px_side: 5000,
                 tile_height_px_focus: 120,
             }
@@ -3808,6 +3838,7 @@ fn load_render_config() -> RenderConfig {
             return RenderConfig {
                 allow_remote_images: false,
                 width_px: 1000,
+                render_scale: 1.0,
                 tile_height_px_side: 5000,
                 tile_height_px_focus: 120,
             }
@@ -3819,6 +3850,7 @@ fn load_render_config() -> RenderConfig {
             return RenderConfig {
                 allow_remote_images: false,
                 width_px: 1000,
+                render_scale: 1.0,
                 tile_height_px_side: 5000,
                 tile_height_px_focus: 120,
             }
@@ -3835,6 +3867,11 @@ fn load_render_config() -> RenderConfig {
         Some(v) => v.as_integer().unwrap_or(1000) as i64,
         None => 1000,
     };
+    let render_scale = render
+        .get("render_scale")
+        .and_then(|v| v.as_float())
+        .unwrap_or(1.0)
+        .clamp(0.25, 4.0);
     let tile_height_px_side = match render.get("tile_height_px_side") {
         Some(v) => v.as_integer().unwrap_or(5000) as i64,
         None => 5000,
@@ -3846,6 +3883,7 @@ fn load_render_config() -> RenderConfig {
     RenderConfig {
         allow_remote_images,
         width_px,
+        render_scale,
         tile_height_px_side,
         tile_height_px_focus,
     }
