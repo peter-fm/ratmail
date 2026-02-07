@@ -10,6 +10,10 @@ crossterm.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
 linkify.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+shell-words.workspace = true
+base64.workspace = true
 
 ratmail-core = { path = "../ratmail-core" }
 ratmail-content = { path = "../ratmail-content" }

@@ -651,7 +651,7 @@ fn fetch_imap_messages(
     Ok(messages)
 }
 
-fn fetch_imap_body(imap: &ImapConfig, folder: &str, uid: u32) -> Result<Vec<u8>> {
+pub fn fetch_imap_body(imap: &ImapConfig, folder: &str, uid: u32) -> Result<Vec<u8>> {
     let mut session = imap_connect(imap)?;
     session.select(folder)?;
     let fetches = session.uid_fetch(uid.to_string(), "RFC822")?;

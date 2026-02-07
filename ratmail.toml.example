@@ -31,3 +31,56 @@ width_px = 1000
 render_scale = 1.0
 tile_height_px_side = 5000
 tile_height_px_focus = 120
+
+[cli]
+enabled = false
+mode = "readonly"
+default_account = "Personal"
+
+[cli.acl]
+accounts = ["Personal"]
+folders = ["INBOX"]
+from_allow = ["*@example.com"]
+fields = ["id", "folder_id", "date", "from", "subject", "unread"]
+allow_body = false
+allow_raw = false
+allow_attachments = false
+# allow_commands = ["messages.list", "message.get"]
+# deny_commands = ["message.delete", "message.move", "send"]
+# allow_move = false
+# allow_delete = false
+# allow_mark = false
+# allow_send = false
+
+# Preset: Agent-safe (locked down)
+#
+# [cli]
+# enabled = true
+# mode = "readonly"
+# default_account = "Personal"
+#
+# [cli.acl]
+# accounts = ["Personal"]
+# folders = ["INBOX"]
+# from_allow = ["*@trusted.com"]
+# fields = ["id", "folder_id", "date", "from", "subject", "unread"]
+# allow_commands = ["accounts.list", "folders.list", "messages.list", "message.get"]
+# allow_body = false
+# allow_raw = false
+# allow_attachments = false
+# allow_move = false
+# allow_delete = false
+# allow_mark = false
+# allow_send = false
+
+# Preset: Full access (use with care)
+#
+# [cli]
+# enabled = true
+# mode = "full-access"
+# default_account = "Personal"
+#
+# [cli.acl]
+# accounts = ["*"]
+# folders = ["*"]
+# from_allow = ["*"]

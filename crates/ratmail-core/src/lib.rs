@@ -528,6 +528,135 @@ impl SqliteMailStore {
         Ok(row.map(|r| r.0))
     }
 
+    pub async fn list_folders(&self, account_id: i64) -> Result<Vec<Folder>> {
+        let folders = sqlx::query_as::<_, (i64, i64, String, i64)>(
+            "SELECT id, account_id, name, unread FROM folders WHERE account_id = ? ORDER BY id",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(folders
+            .into_iter()
+            .map(|row| Folder {
+                id: row.0,
+                account_id: row.1,
+                name: row.2,
+                unread: row.3 as u32,
+            })
+            .collect())
+    }
+
+    pub async fn list_messages(
+        &self,
+        account_id: i64,
+        folder_id: Option<i64>,
+        unread: Option<bool>,
+        since_ts: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<Vec<MessageSummary>> {
+        let mut query = String::from(
+            "SELECT id, folder_id, imap_uid, date, from_addr, subject, unread, preview
+             FROM messages WHERE account_id = ?",
+        );
+        if folder_id.is_some() {
+            query.push_str(" AND folder_id = ?");
+        }
+        if unread.is_some() {
+            query.push_str(" AND unread = ?");
+        }
+        if since_ts.is_some() {
+            query.push_str(" AND COALESCE(date_ts, 0) >= ?");
+        }
+        query.push_str(" ORDER BY COALESCE(date_ts, 0) DESC, id DESC");
+        if limit.is_some() {
+            query.push_str(" LIMIT ?");
+        }
+
+        let mut q = sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, String, i64, String)>(&query)
+            .bind(account_id);
+        if let Some(folder_id) = folder_id {
+            q = q.bind(folder_id);
+        }
+        if let Some(unread) = unread {
+            q = q.bind(if unread { 1 } else { 0 });
+        }
+        if let Some(since_ts) = since_ts {
+            q = q.bind(since_ts);
+        }
+        if let Some(limit) = limit {
+            q = q.bind(limit);
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MessageSummary {
+                id: row.0,
+                folder_id: row.1,
+                imap_uid: row.2.map(|v| v as u32),
+                date: row.3,
+                from: row.4,
+                subject: row.5,
+                unread: row.6 != 0,
+                preview: row.7,
+            })
+            .collect())
+    }
+
+    pub async fn get_message_summary(&self, message_id: i64) -> Result<Option<MessageSummary>> {
+        let row = sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, String, i64, String)>(
+            "SELECT id, folder_id, imap_uid, date, from_addr, subject, unread, preview
+             FROM messages WHERE id = ?",
+        )
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| MessageSummary {
+            id: row.0,
+            folder_id: row.1,
+            imap_uid: row.2.map(|v| v as u32),
+            date: row.3,
+            from: row.4,
+            subject: row.5,
+            unread: row.6 != 0,
+            preview: row.7,
+        }))
+    }
+
+    pub async fn get_message_text(
+        &self,
+        message_id: i64,
+        width_cols: i64,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query_as::<_, (String,)>(
+            "SELECT text FROM cache_text WHERE message_id = ? AND width_cols = ?",
+        )
+        .bind(message_id)
+        .bind(width_cols)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub async fn set_message_unread(&self, message_id: i64, unread: bool) -> Result<()> {
+        let folder_id = sqlx::query_as::<_, (i64,)>(
+            "SELECT folder_id FROM messages WHERE id = ?",
+        )
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| row.0);
+        sqlx::query("UPDATE messages SET unread = ? WHERE id = ?")
+            .bind(if unread { 1 } else { 0 })
+            .bind(message_id)
+            .execute(&self.pool)
+            .await?;
+        if let Some(folder_id) = folder_id {
+            self.update_folder_unread_counts(&[folder_id]).await?;
+        }
+        Ok(())
+    }
+
     pub async fn first_folder_id(&self, account_id: i64) -> Result<Option<i64>> {
         let row = sqlx::query_as::<_, (i64,)>(
             "SELECT id FROM folders WHERE account_id = ? ORDER BY id LIMIT 1",
@@ -535,6 +664,22 @@ impl SqliteMailStore {
         .bind(account_id)
         .fetch_optional(&self.pool)
         .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub async fn account_id_by_name(&self, name: &str) -> Result<Option<i64>> {
+        let row = sqlx::query_as::<_, (i64,)>("SELECT id FROM accounts WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub async fn first_account_id(&self) -> Result<Option<i64>> {
+        let row =
+            sqlx::query_as::<_, (i64,)>("SELECT id FROM accounts ORDER BY id LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|r| r.0))
     }
 

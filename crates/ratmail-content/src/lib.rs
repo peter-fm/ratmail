@@ -63,12 +63,12 @@ pub fn prepare_html(raw: &[u8], allow_remote: bool) -> Result<Option<PreparedHtm
     let html = find_html_part(&parsed)?;
     let Some(html) = html else { return Ok(None) };
 
-    let sanitized = ammonia::clean(&html);
+    let sanitized = sanitize_html(&html);
     let cid_map = collect_cid_map(&parsed)?;
     let mut prepared = inline_cid_images(&sanitized, &cid_map);
     let mut blocked_remote = 0;
     if !allow_remote {
-        let (blocked, count) = block_remote_images(&prepared);
+        let (blocked, count) = block_remote_assets(&prepared);
         prepared = blocked;
         blocked_remote = count;
     }
@@ -77,6 +77,18 @@ pub fn prepare_html(raw: &[u8], allow_remote: bool) -> Result<Option<PreparedHtm
         html: prepared,
         blocked_remote,
     }))
+}
+
+fn sanitize_html(html: &str) -> String {
+    let mut builder = ammonia::Builder::default();
+    builder.rm_clean_content_tags(["style"]);
+    builder.add_tags(["style", "font"]);
+    builder.add_generic_attributes(["style", "background", "bgcolor"]);
+    builder.add_tag_attributes("font", ["face", "size", "color"]);
+    builder.add_tag_attributes("table", ["background", "bgcolor"]);
+    builder.add_tag_attributes("td", ["background", "bgcolor"]);
+    builder.add_tag_attributes("body", ["background", "bgcolor"]);
+    builder.clean(html).to_string()
 }
 
 fn select_body(parsed: &ParsedMail) -> Result<(String, bool)> {
@@ -248,7 +260,7 @@ fn inline_cid_images(html: &str, cid_map: &[(String, String)]) -> String {
     out
 }
 
-fn block_remote_images(html: &str) -> (String, usize) {
+fn block_remote_assets(html: &str) -> (String, usize) {
     let mut out = html.to_string();
     let mut count = 0;
     for prefix in [
@@ -256,6 +268,10 @@ fn block_remote_images(html: &str) -> (String, usize) {
         "src=\"https://",
         "src='http://",
         "src='https://",
+        "background=\"http://",
+        "background=\"https://",
+        "background='http://",
+        "background='https://",
     ] {
         let mut idx = 0;
         while let Some(pos) = out[idx..].find(prefix) {
@@ -272,6 +288,84 @@ fn block_remote_images(html: &str) -> (String, usize) {
             }
         }
     }
+    let (out, css_count) = block_remote_css_urls(&out);
+    (out, count + css_count)
+}
+
+fn block_remote_css_urls(html: &str) -> (String, usize) {
+    let mut out = String::with_capacity(html.len());
+    let mut count = 0;
+    let mut idx = 0;
+    let bytes = html.as_bytes();
+
+    while let Some(pos) = html[idx..].find("url(") {
+        let start = idx + pos;
+        out.push_str(&html[idx..start]);
+        let mut j = start + 4;
+
+        while j < html.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+
+        let mut quote: Option<char> = None;
+        if j < html.len() {
+            let b = bytes[j];
+            if b == b'\'' || b == b'"' {
+                quote = Some(b as char);
+                j += 1;
+            }
+        }
+
+        let url_start = j;
+        let end = if let Some(q) = quote {
+            match html[url_start..].find(q) {
+                Some(rel) => url_start + rel,
+                None => {
+                    out.push_str(&html[start..]);
+                    return (out, count);
+                }
+            }
+        } else {
+            match html[url_start..].find(')') {
+                Some(rel) => url_start + rel,
+                None => {
+                    out.push_str(&html[start..]);
+                    return (out, count);
+                }
+            }
+        };
+
+        let url = html[url_start..end].trim_start();
+        let is_remote = url.starts_with("http://") || url.starts_with("https://");
+
+        let mut end_paren = end;
+        if quote.is_some() {
+            end_paren += 1;
+            while end_paren < html.len() && bytes[end_paren].is_ascii_whitespace() {
+                end_paren += 1;
+            }
+            if end_paren < html.len() && bytes[end_paren] == b')' {
+                end_paren += 1;
+            } else {
+                out.push_str(&html[start..end_paren]);
+                idx = end_paren;
+                continue;
+            }
+        } else {
+            end_paren = end + 1;
+        }
+
+        if is_remote {
+            count += 1;
+            out.push_str("url(\"ratmail-blocked://remote\")");
+        } else {
+            out.push_str(&html[start..end_paren]);
+        }
+
+        idx = end_paren;
+    }
+
+    out.push_str(&html[idx..]);
     (out, count)
 }
 

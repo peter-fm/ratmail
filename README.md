@@ -110,6 +110,80 @@ Notes:
 - `?`: toggle help
 - `q`: quit
 
+## CLI (JSON output)
+
+Ratmail can run CLI subcommands that return JSON for scripting (jq-friendly). The CLI is **disabled by default** for safety. Enable and scope access in `ratmail.toml`:
+
+```toml
+[cli]
+enabled = true
+mode = "readonly" # "readonly" | "readonly-full-access" | "full-access"
+default_account = "Personal"
+
+[cli.acl]
+accounts = ["Personal"]
+folders = ["INBOX"]
+from_allow = ["*@example.com"]
+fields = ["id", "folder_id", "date", "from", "subject", "unread"]
+```
+
+Security notes:
+- Use `from_allow`, `fields`, and a minimal `allow_commands` list to reduce prompt-injection surface for agents.
+- `mode = "readonly"` blocks all mutations. `readonly-full-access` allows full read (including bodies/raw/attachments). `full-access` enables mutations if allowed by ACL.
+- CLI remains disabled unless `enabled = true` is set.
+- CLI outputs include a `schema` field (currently `ratmail.cli.v1`) for stable parsing.
+- `--fetch` pulls raw bodies from IMAP when not cached (requires IMAP + UID); otherwise body/raw may be empty.
+- `--wait` waits for a best-effort completion signal (IMAP fetch events). It is not a hard guarantee that every message is synced.
+
+Preset: Agent-safe (locked down)
+
+```toml
+[cli]
+enabled = true
+mode = "readonly"
+default_account = "Personal"
+
+[cli.acl]
+accounts = ["Personal"]
+folders = ["INBOX"]
+from_allow = ["*@trusted.com"]
+fields = ["id", "folder_id", "date", "from", "subject", "unread"]
+allow_commands = ["accounts.list", "folders.list", "messages.list", "message.get"]
+allow_body = false
+allow_raw = false
+allow_attachments = false
+allow_move = false
+allow_delete = false
+allow_mark = false
+allow_send = false
+```
+
+Preset: Full access (use with care)
+
+```toml
+[cli]
+enabled = true
+mode = "full-access"
+default_account = "Personal"
+
+[cli.acl]
+accounts = ["*"]
+folders = ["*"]
+from_allow = ["*"]
+```
+
+Examples:
+
+```bash
+ratmail accounts list
+ratmail folders list --account Personal
+ratmail messages list --account Personal --folder INBOX --limit 20
+ratmail message get --account Personal --id 123
+ratmail message get --account Personal --id 123 --body --fetch
+ratmail sync --account Personal --folder INBOX --wait --timeout-secs 60
+ratmail send --account Personal --to alice@example.com --subject "Hi" --body "Test" --wait
+```
+
 ## Proton Mail Bridge (Linux)
 
 Bridge uses a local IMAP/SMTP server with a self-signed cert. Use:

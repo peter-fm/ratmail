@@ -5,6 +5,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use clap::{Args, Parser, Subcommand};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -41,6 +44,8 @@ use ratmail_mail::{
 use ratmail_render::{
     ChromiumRenderer, NullRenderer, RemotePolicy, Renderer, detect_image_support,
 };
+use serde_json::{Value as JsonValue, json};
+use shell_words::split as shell_split;
 use std::io::Cursor;
 use std::sync::Arc;
 use zip::{ZipWriter, write::FileOptions};
@@ -48,6 +53,7 @@ use zip::{ZipWriter, write::FileOptions};
 const TICK_RATE: Duration = Duration::from_millis(200);
 const PROTOCOL_CACHE_LIMIT: usize = 16;
 const TILE_CACHE_BUDGET_BYTES: i64 = 256 * 1024 * 1024;
+const CLI_SCHEMA_VERSION: &str = "ratmail.cli.v1";
 
 static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 
@@ -2966,8 +2972,29 @@ async fn render_worker(
 }
 
 fn main() -> Result<()> {
-    let rt = Arc::new(tokio::runtime::Runtime::new()?);
+    let cli = Cli::parse();
     let mut accounts = load_accounts_config();
+    let (cli_requested, cli_command) = match resolve_cli_command(cli) {
+        Ok(result) => result,
+        Err(err) => {
+            return output_error(&err.to_string());
+        }
+    };
+    if cli_requested {
+        let Some(command) = cli_command else {
+            return output_error("No command provided");
+        };
+        if accounts.is_empty() {
+            return output_error("No accounts configured");
+        }
+        let rt = Arc::new(tokio::runtime::Runtime::new()?);
+        if let Err(err) = run_cli(&rt, command, &accounts) {
+            return output_error(&err.to_string());
+        }
+        return Ok(());
+    }
+
+    let rt = Arc::new(tokio::runtime::Runtime::new()?);
     if accounts.is_empty() {
         accounts.push(AccountConfig {
             name: "demo".to_string(),
@@ -4615,6 +4642,234 @@ struct RenderConfig {
     tile_height_px_focus: i64,
 }
 
+#[derive(Parser, Debug)]
+#[command(name = "ratmail", version, about = "Terminal email client")]
+struct Cli {
+    #[arg(short = 'c', long = "cmd")]
+    cmd: Option<String>,
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum CliCommand {
+    Accounts(AccountsCmd),
+    Folders(FoldersCmd),
+    Messages(MessagesCmd),
+    Message(MessageCmd),
+    Sync(SyncCmd),
+    Send(SendCmd),
+}
+
+#[derive(Args, Debug)]
+struct AccountsCmd {
+    #[command(subcommand)]
+    command: AccountsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum AccountsCommand {
+    List,
+}
+
+#[derive(Args, Debug)]
+struct FoldersCmd {
+    #[command(subcommand)]
+    command: FoldersCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum FoldersCommand {
+    List(FoldersList),
+}
+
+#[derive(Args, Debug)]
+struct FoldersList {
+    #[arg(long)]
+    account: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct MessagesCmd {
+    #[command(subcommand)]
+    command: MessagesCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum MessagesCommand {
+    List(MessagesList),
+}
+
+#[derive(Args, Debug)]
+struct MessagesList {
+    #[arg(long)]
+    account: Option<String>,
+    #[arg(long)]
+    folder: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
+    #[arg(long)]
+    unread: bool,
+    #[arg(long)]
+    from: Option<String>,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long = "since-ts")]
+    since_ts: Option<i64>,
+}
+
+#[derive(Args, Debug)]
+struct MessageCmd {
+    #[command(subcommand)]
+    command: MessageCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum MessageCommand {
+    Get(MessageGet),
+    Body(MessageBody),
+    Raw(MessageRaw),
+    Move(MessageMove),
+    Delete(MessageDelete),
+    Mark(MessageMark),
+}
+
+#[derive(Args, Debug)]
+struct MessageGet {
+    #[arg(long)]
+    account: Option<String>,
+    #[arg(long)]
+    id: i64,
+    #[arg(long)]
+    body: bool,
+    #[arg(long)]
+    raw: bool,
+    #[arg(long)]
+    attachments: bool,
+    #[arg(long)]
+    fetch: bool,
+}
+
+#[derive(Args, Debug)]
+struct MessageBody {
+    #[arg(long)]
+    account: Option<String>,
+    #[arg(long)]
+    id: i64,
+    #[arg(long)]
+    fetch: bool,
+}
+
+#[derive(Args, Debug)]
+struct MessageRaw {
+    #[arg(long)]
+    account: Option<String>,
+    #[arg(long)]
+    id: i64,
+    #[arg(long)]
+    fetch: bool,
+}
+
+#[derive(Args, Debug)]
+struct MessageMove {
+    #[arg(long)]
+    account: Option<String>,
+    #[arg(long)]
+    id: i64,
+    #[arg(long)]
+    folder: String,
+}
+
+#[derive(Args, Debug)]
+struct MessageDelete {
+    #[arg(long)]
+    account: Option<String>,
+    #[arg(long)]
+    id: i64,
+}
+
+#[derive(Args, Debug)]
+struct MessageMark {
+    #[arg(long)]
+    account: Option<String>,
+    #[arg(long)]
+    id: i64,
+    #[arg(long)]
+    read: bool,
+    #[arg(long)]
+    unread: bool,
+}
+
+#[derive(Args, Debug)]
+struct SyncCmd {
+    #[arg(long)]
+    account: Option<String>,
+    #[arg(long)]
+    folder: Option<String>,
+    #[arg(long)]
+    backfill: bool,
+    #[arg(long)]
+    days: Option<i64>,
+    #[arg(long)]
+    wait: bool,
+    #[arg(long, default_value_t = 30)]
+    timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct SendCmd {
+    #[arg(long)]
+    account: Option<String>,
+    #[arg(long)]
+    to: String,
+    #[arg(long)]
+    cc: Option<String>,
+    #[arg(long)]
+    bcc: Option<String>,
+    #[arg(long)]
+    subject: String,
+    #[arg(long)]
+    body: String,
+    #[arg(long)]
+    attach: Vec<String>,
+    #[arg(long)]
+    wait: bool,
+    #[arg(long, default_value_t = 30)]
+    timeout_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CliConfig {
+    enabled: bool,
+    mode: CliMode,
+    default_account: Option<String>,
+    acl: CliAcl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliMode {
+    Readonly,
+    ReadonlyFullAccess,
+    FullAccess,
+}
+
+#[derive(Debug, Clone)]
+struct CliAcl {
+    accounts: Option<Vec<String>>,
+    folders: Option<Vec<String>>,
+    from_allow: Option<Vec<String>>,
+    fields: Option<Vec<String>>,
+    allow_body: Option<bool>,
+    allow_raw: Option<bool>,
+    allow_attachments: Option<bool>,
+    allow_commands: Option<Vec<String>>,
+    deny_commands: Option<Vec<String>>,
+    allow_move: Option<bool>,
+    allow_delete: Option<bool>,
+    allow_mark: Option<bool>,
+    allow_send: Option<bool>,
+}
+
 fn load_render_config() -> RenderConfig {
     let content = match load_config_text() {
         Some(content) => content,
@@ -4685,6 +4940,1098 @@ fn load_render_config() -> RenderConfig {
         render_scale,
         tile_height_px_side,
         tile_height_px_focus,
+    }
+}
+
+fn load_cli_config() -> CliConfig {
+    let content = match load_config_text() {
+        Some(content) => content,
+        None => {
+            return CliConfig {
+                enabled: false,
+                mode: CliMode::Readonly,
+                default_account: None,
+                acl: CliAcl::default(),
+            };
+        }
+    };
+    let value: toml::Value = match toml::from_str(&content) {
+        Ok(value) => value,
+        Err(_) => {
+            return CliConfig {
+                enabled: false,
+                mode: CliMode::Readonly,
+                default_account: None,
+                acl: CliAcl::default(),
+            };
+        }
+    };
+    let cli = match value.get("cli") {
+        Some(cli) => cli,
+        None => {
+            return CliConfig {
+                enabled: false,
+                mode: CliMode::Readonly,
+                default_account: None,
+                acl: CliAcl::default(),
+            };
+        }
+    };
+    let enabled = cli
+        .get("enabled")
+        .and_then(parse_bool)
+        .unwrap_or(false);
+    let mode = cli
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .and_then(parse_cli_mode)
+        .unwrap_or(CliMode::Readonly);
+    let default_account = cli
+        .get("default_account")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let acl = cli.get("acl").and_then(parse_cli_acl).unwrap_or_default();
+    CliConfig {
+        enabled,
+        mode,
+        default_account,
+        acl,
+    }
+}
+
+fn parse_cli_mode(raw: &str) -> Option<CliMode> {
+    match raw.to_ascii_lowercase().as_str() {
+        "readonly" => Some(CliMode::Readonly),
+        "readonly-full-access" | "readonly_full_access" | "readonlyfullaccess" => {
+            Some(CliMode::ReadonlyFullAccess)
+        }
+        "full-access" | "full_access" | "fullaccess" => Some(CliMode::FullAccess),
+        _ => None,
+    }
+}
+
+fn parse_cli_acl(value: &toml::Value) -> Option<CliAcl> {
+    Some(CliAcl {
+        accounts: parse_string_list(value, "accounts"),
+        folders: parse_string_list(value, "folders"),
+        from_allow: parse_string_list(value, "from_allow"),
+        fields: parse_string_list(value, "fields"),
+        allow_body: value.get("allow_body").and_then(parse_bool),
+        allow_raw: value.get("allow_raw").and_then(parse_bool),
+        allow_attachments: value.get("allow_attachments").and_then(parse_bool),
+        allow_commands: parse_string_list(value, "allow_commands"),
+        deny_commands: parse_string_list(value, "deny_commands"),
+        allow_move: value.get("allow_move").and_then(parse_bool),
+        allow_delete: value.get("allow_delete").and_then(parse_bool),
+        allow_mark: value.get("allow_mark").and_then(parse_bool),
+        allow_send: value.get("allow_send").and_then(parse_bool),
+    })
+}
+
+fn parse_string_list(value: &toml::Value, key: &str) -> Option<Vec<String>> {
+    let list = value.get(key)?.as_array()?;
+    let mut out = Vec::new();
+    for item in list {
+        if let Some(s) = item.as_str() {
+            out.push(s.to_string());
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn parse_bool(value: &toml::Value) -> Option<bool> {
+    value.as_bool().or_else(|| {
+        value.as_str().map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+    })
+}
+
+impl Default for CliAcl {
+    fn default() -> Self {
+        Self {
+            accounts: None,
+            folders: None,
+            from_allow: None,
+            fields: None,
+            allow_body: None,
+            allow_raw: None,
+            allow_attachments: None,
+            allow_commands: None,
+            deny_commands: None,
+            allow_move: None,
+            allow_delete: None,
+            allow_mark: None,
+            allow_send: None,
+        }
+    }
+}
+
+fn default_readonly_fields() -> HashSet<String> {
+    ["id", "folder_id", "date", "from", "subject", "unread"]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn all_message_fields() -> HashSet<String> {
+    [
+        "id",
+        "folder_id",
+        "imap_uid",
+        "date",
+        "from",
+        "subject",
+        "unread",
+        "preview",
+        "body",
+        "raw",
+        "attachments",
+        "links",
+    ]
+    .into_iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn allowed_fields(config: &CliConfig) -> HashSet<String> {
+    match config.mode {
+        CliMode::Readonly => {
+            let mut out: HashSet<String> = config
+                .acl
+                .fields
+                .as_ref()
+                .map(|v| v.iter().cloned().collect())
+                .unwrap_or_else(default_readonly_fields);
+            if config.acl.allow_body.unwrap_or(false) {
+                out.insert("body".to_string());
+            }
+            if config.acl.allow_raw.unwrap_or(false) {
+                out.insert("raw".to_string());
+            }
+            if config.acl.allow_attachments.unwrap_or(false) {
+                out.insert("attachments".to_string());
+            }
+            out
+        }
+        CliMode::ReadonlyFullAccess | CliMode::FullAccess => all_message_fields(),
+    }
+}
+
+fn acl_allows_command(config: &CliConfig, command_id: &str, is_mutation: bool) -> bool {
+    if is_mutation && config.mode != CliMode::FullAccess {
+        return false;
+    }
+    if let Some(deny) = &config.acl.deny_commands {
+        if matches_any_pattern(deny, command_id) {
+            return false;
+        }
+    }
+    if let Some(allow) = &config.acl.allow_commands {
+        if !matches_any_pattern(allow, command_id) {
+            return false;
+        }
+    }
+    true
+}
+
+fn acl_allows_account(config: &CliConfig, account: &str) -> bool {
+    match &config.acl.accounts {
+        Some(list) => matches_any_pattern(list, account),
+        None => true,
+    }
+}
+
+fn acl_allows_folder(config: &CliConfig, folder: &str) -> bool {
+    match &config.acl.folders {
+        Some(list) => matches_any_pattern(list, folder),
+        None => true,
+    }
+}
+
+fn acl_allows_from(config: &CliConfig, from: &str) -> bool {
+    match &config.acl.from_allow {
+        Some(list) => matches_any_pattern(list, from),
+        None => true,
+    }
+}
+
+fn acl_allows_body(config: &CliConfig) -> bool {
+    matches!(config.mode, CliMode::ReadonlyFullAccess | CliMode::FullAccess)
+        || config.acl.allow_body.unwrap_or(false)
+}
+
+fn acl_allows_raw(config: &CliConfig) -> bool {
+    matches!(config.mode, CliMode::ReadonlyFullAccess | CliMode::FullAccess)
+        || config.acl.allow_raw.unwrap_or(false)
+}
+
+fn acl_allows_attachments(config: &CliConfig) -> bool {
+    matches!(config.mode, CliMode::ReadonlyFullAccess | CliMode::FullAccess)
+        || config.acl.allow_attachments.unwrap_or(false)
+}
+
+fn acl_allows_move(config: &CliConfig) -> bool {
+    config.mode == CliMode::FullAccess && config.acl.allow_move.unwrap_or(true)
+}
+
+fn acl_allows_delete(config: &CliConfig) -> bool {
+    config.mode == CliMode::FullAccess && config.acl.allow_delete.unwrap_or(true)
+}
+
+fn acl_allows_mark(config: &CliConfig) -> bool {
+    config.mode == CliMode::FullAccess && config.acl.allow_mark.unwrap_or(true)
+}
+
+fn acl_allows_send(config: &CliConfig) -> bool {
+    config.mode == CliMode::FullAccess && config.acl.allow_send.unwrap_or(true)
+}
+
+fn matches_any_pattern(patterns: &[String], value: &str) -> bool {
+    patterns.iter().any(|p| wildcard_match(p, value))
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let pattern = pattern.to_ascii_lowercase();
+    let value = value.to_ascii_lowercase();
+    let mut p = pattern.split('*').peekable();
+    let mut remainder = value.as_str();
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    let mut first = true;
+    while let Some(part) = p.next() {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(idx) = remainder.find(part) {
+            if first && !pattern.starts_with('*') && idx != 0 {
+                return false;
+            }
+            remainder = &remainder[idx + part.len()..];
+        } else {
+            return false;
+        }
+        first = false;
+    }
+    if !pattern.ends_with('*') && !remainder.is_empty() {
+        return false;
+    }
+    true
+}
+
+fn output_ok(value: JsonValue) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "schema": CLI_SCHEMA_VERSION,
+            "ok": true,
+            "result": value
+        }))?
+    );
+    Ok(())
+}
+
+fn output_error(message: &str) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "schema": CLI_SCHEMA_VERSION,
+            "ok": false,
+            "error": message
+        }))?
+    );
+    Ok(())
+}
+
+fn resolve_cli_command(cli: Cli) -> Result<(bool, Option<CliCommand>)> {
+    let cli_requested = cli.cmd.is_some() || cli.command.is_some();
+    if let Some(cmd) = cli.cmd {
+        let parts = shell_split(&cmd).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if parts.is_empty() {
+            return Ok((true, None));
+        }
+        let mut args = Vec::with_capacity(parts.len() + 1);
+        args.push("ratmail".to_string());
+        args.extend(parts);
+        let parsed = Cli::try_parse_from(args)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        return Ok((true, parsed.command));
+    }
+    Ok((cli_requested, cli.command))
+}
+
+fn resolve_account<'a>(
+    config: &CliConfig,
+    accounts: &'a [AccountConfig],
+    requested: Option<&str>,
+) -> Result<&'a AccountConfig> {
+    let selected = if let Some(name) = requested {
+        accounts.iter().find(|acct| acct.name == name)
+    } else if let Some(default_name) = config.default_account.as_deref() {
+        accounts.iter().find(|acct| acct.name == default_name)
+    } else if accounts.len() == 1 {
+        accounts.first()
+    } else {
+        None
+    };
+    selected.ok_or_else(|| anyhow::anyhow!("Account not found or not specified"))
+}
+
+fn filter_summary_to_json(
+    summary: &MessageSummary,
+    allowed: &HashSet<String>,
+) -> JsonValue {
+    let mut map = serde_json::Map::new();
+    if allowed.contains("id") {
+        map.insert("id".to_string(), json!(summary.id));
+    }
+    if allowed.contains("folder_id") {
+        map.insert("folder_id".to_string(), json!(summary.folder_id));
+    }
+    if allowed.contains("imap_uid") {
+        map.insert("imap_uid".to_string(), json!(summary.imap_uid));
+    }
+    if allowed.contains("date") {
+        map.insert("date".to_string(), json!(summary.date));
+    }
+    if allowed.contains("from") {
+        map.insert("from".to_string(), json!(summary.from));
+    }
+    if allowed.contains("subject") {
+        map.insert("subject".to_string(), json!(summary.subject));
+    }
+    if allowed.contains("unread") {
+        map.insert("unread".to_string(), json!(summary.unread));
+    }
+    if allowed.contains("preview") {
+        map.insert("preview".to_string(), json!(summary.preview));
+    }
+    JsonValue::Object(map)
+}
+
+fn parse_since_ts(raw: &str) -> Result<i64> {
+    mailparse::dateparse(raw)
+        .map_err(|_| anyhow::anyhow!("Invalid date for --since"))
+}
+
+fn map_folder_names(folders: &[Folder]) -> HashMap<i64, String> {
+    folders
+        .iter()
+        .map(|f| (f.id, f.name.clone()))
+        .collect()
+}
+
+fn parse_from_addrs(input: &str) -> Vec<String> {
+    match mailparse::addrparse(input) {
+        Ok(list) => mailaddrs_to_emails(&list),
+        Err(_) => {
+            let fallback = extract_email(input);
+            if fallback.is_empty() {
+                Vec::new()
+            } else {
+                vec![fallback]
+            }
+        }
+    }
+}
+
+fn from_matches_filter(from_raw: &str, filter: &str) -> bool {
+    let needle = filter.to_ascii_lowercase();
+    if from_raw.to_ascii_lowercase().contains(&needle) {
+        return true;
+    }
+    for addr in parse_from_addrs(from_raw) {
+        if addr.to_ascii_lowercase().contains(&needle) {
+            return true;
+        }
+    }
+    false
+}
+
+fn account_id_for(rt: &Arc<tokio::runtime::Runtime>, store: &SqliteMailStore, name: &str) -> i64 {
+    rt.block_on(store.account_id_by_name(name))
+        .ok()
+        .flatten()
+        .or_else(|| rt.block_on(store.first_account_id()).ok().flatten())
+        .unwrap_or(1)
+}
+
+fn maybe_fetch_raw(
+    rt: &Arc<tokio::runtime::Runtime>,
+    store: &SqliteMailStore,
+    imap: Option<&ImapConfig>,
+    folder_name: Option<&str>,
+    uid: Option<u32>,
+    message_id: i64,
+    fetch: bool,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(raw) = rt.block_on(store.get_raw_body(message_id))? {
+        return Ok(Some(raw));
+    }
+    if !fetch {
+        return Ok(None);
+    }
+    let (Some(imap), Some(folder), Some(uid)) = (imap, folder_name, uid) else {
+        return Ok(None);
+    };
+    let raw = ratmail_mail::fetch_imap_body(imap, folder, uid)?;
+    rt.block_on(store.upsert_raw_body(message_id, &raw))?;
+    if let Ok(display) = extract_display(&raw, DEFAULT_TEXT_WIDTH as usize) {
+        let _ = rt.block_on(store.upsert_cache_text(
+            message_id,
+            DEFAULT_TEXT_WIDTH,
+            &display.text,
+        ));
+    }
+    Ok(Some(raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> CliConfig {
+        CliConfig {
+            enabled: true,
+            mode: CliMode::Readonly,
+            default_account: None,
+            acl: CliAcl::default(),
+        }
+    }
+
+    #[test]
+    fn test_wildcard_match() {
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("alice@example.com", "alice@example.com"));
+        assert!(!wildcard_match("alice@example.com", "bob@example.com"));
+        assert!(wildcard_match("*@example.com", "alice@example.com"));
+        assert!(!wildcard_match("*@example.com", "alice@other.com"));
+        assert!(wildcard_match("support*", "support+alerts"));
+        assert!(!wildcard_match("support*", "sales"));
+    }
+
+    #[test]
+    fn test_acl_command_gating() {
+        let mut cfg = base_config();
+        assert!(acl_allows_command(&cfg, "messages.list", false));
+        assert!(!acl_allows_command(&cfg, "message.delete", true));
+
+        cfg.mode = CliMode::FullAccess;
+        cfg.acl.allow_commands = Some(vec!["messages.*".to_string()]);
+        assert!(acl_allows_command(&cfg, "messages.list", false));
+        assert!(!acl_allows_command(&cfg, "message.delete", true));
+
+        cfg.acl.allow_commands = None;
+        cfg.acl.deny_commands = Some(vec!["message.delete".to_string()]);
+        assert!(!acl_allows_command(&cfg, "message.delete", true));
+    }
+
+    #[test]
+    fn test_allowed_fields_readonly_defaults() {
+        let cfg = base_config();
+        let fields = allowed_fields(&cfg);
+        assert!(fields.contains("id"));
+        assert!(fields.contains("subject"));
+        assert!(!fields.contains("body"));
+    }
+
+    #[test]
+    fn test_allowed_fields_readonly_overrides() {
+        let mut cfg = base_config();
+        cfg.acl.fields = Some(vec!["id".to_string(), "from".to_string()]);
+        let fields = allowed_fields(&cfg);
+        assert!(fields.contains("id"));
+        assert!(fields.contains("from"));
+        assert!(!fields.contains("subject"));
+    }
+
+    #[test]
+    fn test_body_raw_attachment_gates() {
+        let mut cfg = base_config();
+        assert!(!acl_allows_body(&cfg));
+        assert!(!acl_allows_raw(&cfg));
+        assert!(!acl_allows_attachments(&cfg));
+
+        cfg.acl.allow_body = Some(true);
+        cfg.acl.allow_raw = Some(true);
+        cfg.acl.allow_attachments = Some(true);
+        assert!(acl_allows_body(&cfg));
+        assert!(acl_allows_raw(&cfg));
+        assert!(acl_allows_attachments(&cfg));
+
+        cfg.mode = CliMode::ReadonlyFullAccess;
+        assert!(acl_allows_body(&cfg));
+        assert!(acl_allows_raw(&cfg));
+        assert!(acl_allows_attachments(&cfg));
+    }
+
+    #[test]
+    fn test_from_acl() {
+        let mut cfg = base_config();
+        cfg.acl.from_allow = Some(vec!["*@trusted.com".to_string()]);
+        assert!(acl_allows_from(&cfg, "boss@trusted.com"));
+        assert!(!acl_allows_from(&cfg, "spam@evil.com"));
+    }
+}
+
+fn run_cli(rt: &Arc<tokio::runtime::Runtime>, command: CliCommand, accounts: &[AccountConfig]) -> Result<()> {
+    let config = load_cli_config();
+    if !config.enabled {
+        return output_error("CLI disabled (set [cli].enabled = true)");
+    }
+    let allowed = allowed_fields(&config);
+
+    match command {
+        CliCommand::Accounts(cmd) => match cmd.command {
+            AccountsCommand::List => {
+                if !acl_allows_command(&config, "accounts.list", false) {
+                    return output_error("Command not allowed");
+                }
+                let mut out = Vec::new();
+                for acct in accounts {
+                    if !acl_allows_account(&config, &acct.name) {
+                        continue;
+                    }
+                    let address = acct
+                        .imap
+                        .as_ref()
+                        .map(|i| i.username.clone())
+                        .or_else(|| acct.smtp.as_ref().map(|s| s.username.clone()))
+                        .unwrap_or_default();
+                    out.push(json!({
+                        "name": acct.name,
+                        "address": address,
+                        "db_path": acct.db_path,
+                        "imap": acct.imap.is_some(),
+                        "smtp": acct.smtp.is_some(),
+                    }));
+                }
+                return output_ok(json!(out));
+            }
+        },
+        CliCommand::Folders(cmd) => match cmd.command {
+            FoldersCommand::List(args) => {
+                if !acl_allows_command(&config, "folders.list", false) {
+                    return output_error("Command not allowed");
+                }
+                let account = resolve_account(&config, accounts, args.account.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if !acl_allows_account(&config, &account.name) {
+                    return output_error("Account not allowed");
+                }
+                let store = rt.block_on(SqliteMailStore::connect(&account.db_path))?;
+                let account_id = account_id_for(rt, &store, &account.name);
+                let folders = rt.block_on(store.list_folders(account_id))?;
+                let filtered: Vec<Folder> = folders
+                    .into_iter()
+                    .filter(|f| acl_allows_folder(&config, &f.name))
+                    .collect();
+                return output_ok(json!(filtered));
+            }
+        },
+        CliCommand::Messages(cmd) => match cmd.command {
+            MessagesCommand::List(args) => {
+                if !acl_allows_command(&config, "messages.list", false) {
+                    return output_error("Command not allowed");
+                }
+                let account = resolve_account(&config, accounts, args.account.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if !acl_allows_account(&config, &account.name) {
+                    return output_error("Account not allowed");
+                }
+                let store = rt.block_on(SqliteMailStore::connect(&account.db_path))?;
+                let account_id = account_id_for(rt, &store, &account.name);
+                let folder_id = if let Some(folder) = &args.folder {
+                    if !acl_allows_folder(&config, folder) {
+                        return output_error("Folder not allowed");
+                    }
+                    let id = rt
+                        .block_on(store.folder_id_by_name(account_id, folder))?
+                        .ok_or_else(|| anyhow::anyhow!("Folder not found"))?;
+                    Some(id)
+                } else {
+                    None
+                };
+                let since_ts = if let Some(ts) = args.since_ts {
+                    Some(ts)
+                } else if let Some(since) = &args.since {
+                    Some(parse_since_ts(since)?)
+                } else {
+                    None
+                };
+                let unread = if args.unread { Some(true) } else { None };
+                let mut messages = rt.block_on(store.list_messages(
+                    account_id,
+                    folder_id,
+                    unread,
+                    since_ts,
+                    Some(args.limit as i64),
+                ))?;
+                let folders = rt.block_on(store.list_folders(account_id)).unwrap_or_default();
+                let folder_map = map_folder_names(&folders);
+                if let Some(filter) = args.from.as_deref() {
+                    messages.retain(|m| from_matches_filter(&m.from, filter));
+                }
+                let mut out = Vec::new();
+                for message in messages {
+                    if let Some(folder_name) = folder_map.get(&message.folder_id) {
+                        if !acl_allows_folder(&config, folder_name) {
+                            continue;
+                        }
+                    }
+                    let from_emails = parse_from_addrs(&message.from);
+                    if !from_emails.iter().any(|addr| acl_allows_from(&config, addr))
+                        && !acl_allows_from(&config, &message.from)
+                    {
+                        continue;
+                    }
+                    out.push(filter_summary_to_json(&message, &allowed));
+                }
+                return output_ok(json!(out));
+            }
+        },
+        CliCommand::Message(cmd) => match cmd.command {
+            MessageCommand::Get(args) => {
+                if !acl_allows_command(&config, "message.get", false) {
+                    return output_error("Command not allowed");
+                }
+                let account = resolve_account(&config, accounts, args.account.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if !acl_allows_account(&config, &account.name) {
+                    return output_error("Account not allowed");
+                }
+                let store = rt.block_on(SqliteMailStore::connect(&account.db_path))?;
+                let account_id = account_id_for(rt, &store, &account.name);
+                let summary = rt
+                    .block_on(store.get_message_summary(args.id))?
+                    .ok_or_else(|| anyhow::anyhow!("Message not found"))?;
+                let folders = rt.block_on(store.list_folders(account_id)).unwrap_or_default();
+                let folder_map = map_folder_names(&folders);
+                if let Some(folder_name) = folder_map.get(&summary.folder_id) {
+                    if !acl_allows_folder(&config, folder_name) {
+                        return output_error("Folder not allowed");
+                    }
+                }
+                let from_emails = parse_from_addrs(&summary.from);
+                if !from_emails.iter().any(|addr| acl_allows_from(&config, addr))
+                    && !acl_allows_from(&config, &summary.from)
+                {
+                    return output_error("Sender not allowed");
+                }
+                let mut obj = match filter_summary_to_json(&summary, &allowed) {
+                    JsonValue::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+
+                if args.body && acl_allows_body(&config) && allowed.contains("body") {
+                    let raw = maybe_fetch_raw(
+                        rt,
+                        &store,
+                        account.imap.as_ref(),
+                        folder_map.get(&summary.folder_id).map(|s| s.as_str()),
+                        summary.imap_uid,
+                        summary.id,
+                        args.fetch,
+                    )?;
+                    let body = if let Some(body) =
+                        rt.block_on(store.get_message_text(summary.id, DEFAULT_TEXT_WIDTH))?
+                    {
+                        body
+                    } else if let Some(raw) = raw {
+                        extract_display(&raw, DEFAULT_TEXT_WIDTH as usize)
+                            .map(|d| d.text)
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    obj.insert("body".to_string(), json!(body));
+                }
+
+                if args.raw && acl_allows_raw(&config) && allowed.contains("raw") {
+                    if let Some(raw) = maybe_fetch_raw(
+                        rt,
+                        &store,
+                        account.imap.as_ref(),
+                        folder_map.get(&summary.folder_id).map(|s| s.as_str()),
+                        summary.imap_uid,
+                        summary.id,
+                        args.fetch,
+                    )? {
+                        let encoded = BASE64_STANDARD.encode(raw);
+                        obj.insert("raw".to_string(), json!(encoded));
+                    }
+                }
+
+                if args.attachments && acl_allows_attachments(&config) && allowed.contains("attachments") {
+                    if let Some(raw) = maybe_fetch_raw(
+                        rt,
+                        &store,
+                        account.imap.as_ref(),
+                        folder_map.get(&summary.folder_id).map(|s| s.as_str()),
+                        summary.imap_uid,
+                        summary.id,
+                        args.fetch,
+                    )? {
+                        if let Ok(attachments) = extract_attachments(&raw) {
+                            obj.insert("attachments".to_string(), json!(attachments));
+                        }
+                    }
+                }
+
+                return output_ok(JsonValue::Object(obj));
+            }
+            MessageCommand::Body(args) => {
+                if !acl_allows_command(&config, "message.body", false) {
+                    return output_error("Command not allowed");
+                }
+                if !acl_allows_body(&config) || !allowed.contains("body") {
+                    return output_error("Body access not allowed");
+                }
+                let account = resolve_account(&config, accounts, args.account.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if !acl_allows_account(&config, &account.name) {
+                    return output_error("Account not allowed");
+                }
+                let store = rt.block_on(SqliteMailStore::connect(&account.db_path))?;
+                let account_id = account_id_for(rt, &store, &account.name);
+                let summary = rt
+                    .block_on(store.get_message_summary(args.id))?
+                    .ok_or_else(|| anyhow::anyhow!("Message not found"))?;
+                let folders = rt.block_on(store.list_folders(account_id)).unwrap_or_default();
+                let folder_map = map_folder_names(&folders);
+                if let Some(folder_name) = folder_map.get(&summary.folder_id) {
+                    if !acl_allows_folder(&config, folder_name) {
+                        return output_error("Folder not allowed");
+                    }
+                }
+                let from_emails = parse_from_addrs(&summary.from);
+                if !from_emails.iter().any(|addr| acl_allows_from(&config, addr))
+                    && !acl_allows_from(&config, &summary.from)
+                {
+                    return output_error("Sender not allowed");
+                }
+                let raw = maybe_fetch_raw(
+                    rt,
+                    &store,
+                    account.imap.as_ref(),
+                    folder_map.get(&summary.folder_id).map(|s| s.as_str()),
+                    summary.imap_uid,
+                    summary.id,
+                    args.fetch,
+                )?;
+                let body = if let Some(body) =
+                    rt.block_on(store.get_message_text(summary.id, DEFAULT_TEXT_WIDTH))?
+                {
+                    body
+                } else if let Some(raw) = raw {
+                    extract_display(&raw, DEFAULT_TEXT_WIDTH as usize)
+                        .map(|d| d.text)
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                return output_ok(json!({ "id": summary.id, "body": body }));
+            }
+            MessageCommand::Raw(args) => {
+                if !acl_allows_command(&config, "message.raw", false) {
+                    return output_error("Command not allowed");
+                }
+                if !acl_allows_raw(&config) || !allowed.contains("raw") {
+                    return output_error("Raw access not allowed");
+                }
+                let account = resolve_account(&config, accounts, args.account.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if !acl_allows_account(&config, &account.name) {
+                    return output_error("Account not allowed");
+                }
+                let store = rt.block_on(SqliteMailStore::connect(&account.db_path))?;
+                let account_id = account_id_for(rt, &store, &account.name);
+                let summary = rt
+                    .block_on(store.get_message_summary(args.id))?
+                    .ok_or_else(|| anyhow::anyhow!("Message not found"))?;
+                let folders = rt.block_on(store.list_folders(account_id)).unwrap_or_default();
+                let folder_map = map_folder_names(&folders);
+                if let Some(folder_name) = folder_map.get(&summary.folder_id) {
+                    if !acl_allows_folder(&config, folder_name) {
+                        return output_error("Folder not allowed");
+                    }
+                }
+                let from_emails = parse_from_addrs(&summary.from);
+                if !from_emails.iter().any(|addr| acl_allows_from(&config, addr))
+                    && !acl_allows_from(&config, &summary.from)
+                {
+                    return output_error("Sender not allowed");
+                }
+                if let Some(raw) = maybe_fetch_raw(
+                    rt,
+                    &store,
+                    account.imap.as_ref(),
+                    folder_map.get(&summary.folder_id).map(|s| s.as_str()),
+                    summary.imap_uid,
+                    summary.id,
+                    args.fetch,
+                )? {
+                    let encoded = BASE64_STANDARD.encode(raw);
+                    return output_ok(json!({ "id": summary.id, "raw": encoded }));
+                }
+                return output_ok(json!({ "id": summary.id, "raw": null }));
+            }
+            MessageCommand::Move(args) => {
+                if !acl_allows_command(&config, "message.move", true) || !acl_allows_move(&config) {
+                    return output_error("Command not allowed");
+                }
+                let account = resolve_account(&config, accounts, args.account.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if !acl_allows_account(&config, &account.name) {
+                    return output_error("Account not allowed");
+                }
+                if !acl_allows_folder(&config, &args.folder) {
+                    return output_error("Target folder not allowed");
+                }
+                let store = rt.block_on(SqliteMailStore::connect(&account.db_path))?;
+                let account_id = account_id_for(rt, &store, &account.name);
+                let summary = rt
+                    .block_on(store.get_message_summary(args.id))?
+                    .ok_or_else(|| anyhow::anyhow!("Message not found"))?;
+                let folders = rt.block_on(store.list_folders(account_id)).unwrap_or_default();
+                let folder_map = map_folder_names(&folders);
+                if let Some(folder_name) = folder_map.get(&summary.folder_id) {
+                    if !acl_allows_folder(&config, folder_name) {
+                        return output_error("Source folder not allowed");
+                    }
+                }
+                let target_id = rt
+                    .block_on(store.folder_id_by_name(account_id, &args.folder))?
+                    .ok_or_else(|| anyhow::anyhow!("Target folder not found"))?;
+                rt.block_on(store.move_messages(&[summary.id], target_id))?;
+                if let (Some(imap), Some(uid), Some(src_name)) = (
+                    account.imap.clone(),
+                    summary.imap_uid,
+                    folder_map.get(&summary.folder_id),
+                ) {
+                    let (engine, _events) = rt.block_on(async { MailEngine::start(None, Some(imap)) });
+                    let _ = engine.send(MailCommand::MoveMessages {
+                        folder_name: src_name.clone(),
+                        target_folder: args.folder.clone(),
+                        uids: vec![uid],
+                    });
+                }
+                return output_ok(json!({ "id": summary.id, "moved_to": args.folder }));
+            }
+            MessageCommand::Delete(args) => {
+                if !acl_allows_command(&config, "message.delete", true) || !acl_allows_delete(&config) {
+                    return output_error("Command not allowed");
+                }
+                let account = resolve_account(&config, accounts, args.account.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if !acl_allows_account(&config, &account.name) {
+                    return output_error("Account not allowed");
+                }
+                let store = rt.block_on(SqliteMailStore::connect(&account.db_path))?;
+                let account_id = account_id_for(rt, &store, &account.name);
+                let summary = rt
+                    .block_on(store.get_message_summary(args.id))?
+                    .ok_or_else(|| anyhow::anyhow!("Message not found"))?;
+                let folders = rt.block_on(store.list_folders(account_id)).unwrap_or_default();
+                let folder_map = map_folder_names(&folders);
+                if let Some(folder_name) = folder_map.get(&summary.folder_id) {
+                    if !acl_allows_folder(&config, folder_name) {
+                        return output_error("Folder not allowed");
+                    }
+                }
+                rt.block_on(store.delete_messages(&[summary.id]))?;
+                if let (Some(imap), Some(uid), Some(src_name)) = (
+                    account.imap.clone(),
+                    summary.imap_uid,
+                    folder_map.get(&summary.folder_id),
+                ) {
+                    let (engine, _events) = rt.block_on(async { MailEngine::start(None, Some(imap)) });
+                    let _ = engine.send(MailCommand::DeleteMessages {
+                        folder_name: src_name.clone(),
+                        uids: vec![uid],
+                    });
+                }
+                return output_ok(json!({ "id": summary.id, "deleted": true }));
+            }
+            MessageCommand::Mark(args) => {
+                if !acl_allows_command(&config, "message.mark", true) || !acl_allows_mark(&config) {
+                    return output_error("Command not allowed");
+                }
+                if args.read == args.unread {
+                    return output_error("Specify exactly one of --read or --unread");
+                }
+                let unread = args.unread;
+                let account = resolve_account(&config, accounts, args.account.as_deref())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if !acl_allows_account(&config, &account.name) {
+                    return output_error("Account not allowed");
+                }
+                let store = rt.block_on(SqliteMailStore::connect(&account.db_path))?;
+                let account_id = account_id_for(rt, &store, &account.name);
+                let summary = rt
+                    .block_on(store.get_message_summary(args.id))?
+                    .ok_or_else(|| anyhow::anyhow!("Message not found"))?;
+                let folders = rt.block_on(store.list_folders(account_id)).unwrap_or_default();
+                let folder_map = map_folder_names(&folders);
+                if let Some(folder_name) = folder_map.get(&summary.folder_id) {
+                    if !acl_allows_folder(&config, folder_name) {
+                        return output_error("Folder not allowed");
+                    }
+                }
+                rt.block_on(store.set_message_unread(summary.id, unread))?;
+                if let Some(imap) = account.imap.clone() {
+                    let (engine, _events) = rt.block_on(async { MailEngine::start(None, Some(imap)) });
+                    let _ = engine.send(MailCommand::SetFlag {
+                        message_id: summary.id,
+                        seen: !unread,
+                    });
+                }
+                return output_ok(json!({ "id": summary.id, "unread": unread }));
+            }
+        },
+        CliCommand::Sync(cmd) => {
+            if !acl_allows_command(&config, "sync", true) {
+                return output_error("Command not allowed");
+            }
+            let account = resolve_account(&config, accounts, cmd.account.as_deref())
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if !acl_allows_account(&config, &account.name) {
+                return output_error("Account not allowed");
+            }
+            let Some(imap) = account.imap.clone() else {
+                return output_error("IMAP not configured");
+            };
+            let (engine, mut events) = rt.block_on(async { MailEngine::start(None, Some(imap)) });
+            if let Some(folder_name) = cmd.folder {
+                if !acl_allows_folder(&config, &folder_name) {
+                    return output_error("Folder not allowed");
+                }
+                let store = rt.block_on(SqliteMailStore::connect(&account.db_path))?;
+                let account_id = account_id_for(rt, &store, &account.name);
+                let folder_id = rt
+                    .block_on(store.folder_id_by_name(account_id, &folder_name))?
+                    .ok_or_else(|| anyhow::anyhow!("Folder not found"))?;
+                let state = rt.block_on(store.get_folder_sync_state(folder_id)).ok().flatten();
+                let mode = if cmd.backfill {
+                    let before_ts = state.and_then(|s| s.oldest_ts).unwrap_or(0);
+                    ratmail_mail::SyncMode::Backfill {
+                        before_ts,
+                        window_days: cmd.days.unwrap_or(account.imap.as_ref().map(|i| i.initial_sync_days).unwrap_or(90)),
+                    }
+                } else if let Some(uid) = state.and_then(|s| s.last_seen_uid).map(|v| v as u32) {
+                    ratmail_mail::SyncMode::Incremental { last_seen_uid: uid }
+                } else {
+                    ratmail_mail::SyncMode::Initial {
+                        days: cmd.days.unwrap_or(account.imap.as_ref().map(|i| i.initial_sync_days).unwrap_or(90)),
+                    }
+                };
+                let _ = engine.send(MailCommand::SyncFolderByName { name: folder_name, mode });
+                if cmd.wait {
+                    let deadline = Instant::now() + Duration::from_secs(cmd.timeout_secs);
+                    loop {
+                        if Instant::now() > deadline {
+                            return output_error("Sync timeout");
+                        }
+                        if let Ok(event) = events.try_recv() {
+                            match event {
+                                MailEvent::ImapMessages { .. } => {
+                                    return output_ok(json!({ "synced": true }));
+                                }
+                                MailEvent::ImapError { reason } => {
+                                    return output_error(&format!("Sync failed: {}", reason));
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+                }
+                return output_ok(json!({ "queued": true }));
+            }
+            let _ = engine.send(MailCommand::SyncAll);
+            if cmd.wait {
+                let deadline = Instant::now() + Duration::from_secs(cmd.timeout_secs);
+                loop {
+                    if Instant::now() > deadline {
+                        return output_error("Sync timeout");
+                    }
+                    if let Ok(event) = events.try_recv() {
+                        match event {
+                            MailEvent::ImapMessages { .. } => {
+                                return output_ok(json!({ "synced": true }));
+                            }
+                            MailEvent::ImapError { reason } => {
+                                return output_error(&format!("Sync failed: {}", reason));
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+            return output_ok(json!({ "queued": true }));
+        }
+        CliCommand::Send(cmd) => {
+            if !acl_allows_command(&config, "send", true) || !acl_allows_send(&config) {
+                return output_error("Command not allowed");
+            }
+            let account = resolve_account(&config, accounts, cmd.account.as_deref())
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if !acl_allows_account(&config, &account.name) {
+                return output_error("Account not allowed");
+            }
+            let Some(smtp) = account.smtp.clone() else {
+                return output_error("SMTP not configured");
+            };
+            let attachments = cmd
+                .attach
+                .iter()
+                .filter_map(|path| std::fs::read(path).ok().map(|data| (path, data)))
+                .map(|(path, data)| OutgoingAttachment {
+                    filename: Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "attachment".to_string()),
+                    mime: MimeGuess::from_path(path)
+                        .first_or_octet_stream()
+                        .to_string(),
+                    data,
+                })
+                .collect::<Vec<_>>();
+            let (engine, mut events) = rt.block_on(async { MailEngine::start(Some(smtp), None) });
+            let _ = engine.send(MailCommand::SendMessage {
+                to: cmd.to,
+                cc: cmd.cc.unwrap_or_default(),
+                bcc: cmd.bcc.unwrap_or_default(),
+                subject: cmd.subject,
+                body: cmd.body,
+                attachments,
+            });
+            if cmd.wait {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(cmd.timeout_secs) {
+                    if let Ok(event) = events.try_recv() {
+                        match event {
+                            MailEvent::SendCompleted => {
+                                return output_ok(json!({ "sent": true }));
+                            }
+                            MailEvent::SendFailed { reason } => {
+                                return output_error(&format!("Send failed: {}", reason));
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                return output_error("Send timeout");
+            }
+            return output_ok(json!({ "queued": true }));
+        }
     }
 }
 
