@@ -5175,11 +5175,11 @@ fn load_render_config() -> RenderConfig {
         Some(content) => content,
         None => {
             return RenderConfig {
-                allow_remote_images: false,
-                width_px: 1000,
-                render_scale: 1.0,
-                tile_height_px_side: 5000,
-                tile_height_px_focus: 120,
+                allow_remote_images: true,
+                width_px: 800,
+                render_scale: 1.5,
+                tile_height_px_side: 1000,
+                tile_height_px_focus: 60,
             };
         }
     };
@@ -5187,11 +5187,11 @@ fn load_render_config() -> RenderConfig {
         Ok(value) => value,
         Err(_) => {
             return RenderConfig {
-                allow_remote_images: false,
-                width_px: 1000,
-                render_scale: 1.0,
-                tile_height_px_side: 5000,
-                tile_height_px_focus: 120,
+                allow_remote_images: true,
+                width_px: 800,
+                render_scale: 1.5,
+                tile_height_px_side: 1000,
+                tile_height_px_focus: 60,
             };
         }
     };
@@ -5199,11 +5199,11 @@ fn load_render_config() -> RenderConfig {
         Some(render) => render,
         None => {
             return RenderConfig {
-                allow_remote_images: false,
-                width_px: 1000,
-                render_scale: 1.0,
-                tile_height_px_side: 5000,
-                tile_height_px_focus: 120,
+                allow_remote_images: true,
+                width_px: 800,
+                render_scale: 1.5,
+                tile_height_px_side: 1000,
+                tile_height_px_focus: 60,
             };
         }
     };
@@ -5214,25 +5214,25 @@ fn load_render_config() -> RenderConfig {
                 v.as_str()
                     .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             })
-            .unwrap_or(false),
-        None => false,
+            .unwrap_or(true),
+        None => true,
     };
     let width_px = match render.get("width_px") {
-        Some(v) => v.as_integer().unwrap_or(1000) as i64,
-        None => 1000,
+        Some(v) => v.as_integer().unwrap_or(800) as i64,
+        None => 800,
     };
     let render_scale = render
         .get("render_scale")
         .and_then(|v| v.as_float())
-        .unwrap_or(1.0)
+        .unwrap_or(1.5)
         .clamp(0.25, 4.0);
     let tile_height_px_side = match render.get("tile_height_px_side") {
-        Some(v) => v.as_integer().unwrap_or(5000) as i64,
-        None => 5000,
+        Some(v) => v.as_integer().unwrap_or(1000) as i64,
+        None => 1000,
     };
     let tile_height_px_focus = match render.get("tile_height_px_focus") {
-        Some(v) => v.as_integer().unwrap_or(120) as i64,
-        None => 120,
+        Some(v) => v.as_integer().unwrap_or(60) as i64,
+        None => 60,
     };
     RenderConfig {
         allow_remote_images,
@@ -5248,7 +5248,7 @@ fn load_ui_config() -> UiConfig {
         Some(content) => content,
         None => {
             return UiConfig {
-                folder_width_cols: 15,
+                folder_width_cols: 25,
             };
         }
     };
@@ -5256,7 +5256,7 @@ fn load_ui_config() -> UiConfig {
         Ok(value) => value,
         Err(_) => {
             return UiConfig {
-                folder_width_cols: 15,
+                folder_width_cols: 25,
             };
         }
     };
@@ -5264,13 +5264,13 @@ fn load_ui_config() -> UiConfig {
         Some(ui) => ui,
         None => {
             return UiConfig {
-                folder_width_cols: 15,
+                folder_width_cols: 25,
             };
         }
     };
     let folder_width_cols = match ui.get("folder_width_cols") {
-        Some(v) => v.as_integer().unwrap_or(15) as i64,
-        None => 15,
+        Some(v) => v.as_integer().unwrap_or(25) as i64,
+        None => 25,
     };
     UiConfig {
         folder_width_cols: folder_width_cols.clamp(8, 40) as u16,
