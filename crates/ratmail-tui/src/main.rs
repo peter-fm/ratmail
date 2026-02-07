@@ -2843,6 +2843,33 @@ fn cursor_line_col(text: &str, cursor: usize) -> (usize, usize) {
     (line, col)
 }
 
+fn cursor_line_col_wrapped(text: &str, cursor: usize, width: usize) -> (usize, usize) {
+    if width == 0 {
+        return (0, 0);
+    }
+    let mut line = 0usize;
+    let mut col = 0usize;
+    let mut idx = 0usize;
+    let max = clamp_cursor(cursor, text);
+    for ch in text.chars() {
+        if idx == max {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+            if col >= width {
+                line += 1;
+                col = 0;
+            }
+        }
+        idx += 1;
+    }
+    (line, col)
+}
+
 fn line_col_to_cursor(text: &str, line: usize, col: usize) -> usize {
     let lines: Vec<&str> = text.split('\n').collect();
     if lines.is_empty() {
@@ -4703,7 +4730,10 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
         body.push_str(&app.compose_quote);
         body
     };
-    frame.render_widget(Paragraph::new(body_display), rows[6]);
+    frame.render_widget(
+        Paragraph::new(body_display).wrap(Wrap { trim: false }),
+        rows[6],
+    );
 
     let footer = if let Some(msg) = &app.status_message {
         format!(
@@ -4735,9 +4765,12 @@ fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
             &app.compose_subject,
             app.compose_cursor_subject,
         ),
-        ComposeFocus::Body => {
-            set_cursor_at(frame, rows[6], &app.compose_body, app.compose_cursor_body)
-        }
+        ComposeFocus::Body => set_cursor_at_wrapped(
+            frame,
+            rows[6],
+            &app.compose_body,
+            app.compose_cursor_body,
+        ),
     }
 }
 
@@ -4746,6 +4779,18 @@ fn set_cursor_at(frame: &mut ratatui::Frame, area: Rect, text: &str, cursor: usi
         return;
     }
     let (line, col) = cursor_line_col(text, cursor);
+    let max_x = area.width.saturating_sub(1);
+    let max_y = area.height.saturating_sub(1);
+    let x = area.x + (col as u16).min(max_x);
+    let y = area.y + (line as u16).min(max_y);
+    frame.set_cursor_position((x, y));
+}
+
+fn set_cursor_at_wrapped(frame: &mut ratatui::Frame, area: Rect, text: &str, cursor: usize) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let (line, col) = cursor_line_col_wrapped(text, cursor, area.width as usize);
     let max_x = area.width.saturating_sub(1);
     let max_y = area.height.saturating_sub(1);
     let x = area.x + (col as u16).min(max_x);
