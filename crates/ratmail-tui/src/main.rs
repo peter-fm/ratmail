@@ -3765,11 +3765,77 @@ fn link_display_label(link: &LinkInfo, index: Option<usize>) -> String {
     }
     if link.from_html {
         if let Some(idx) = index {
-            return format!("Image link {}", idx + 1);
+            return format!("Image Link {}", idx + 1);
         }
-        return "Image link".to_string();
+        return "Image Link".to_string();
     }
     link.url.clone()
+}
+
+const LINK_MARK_START: &str = "\u{1e}";
+const LINK_MARK_END: &str = "\u{1f}";
+
+fn apply_link_markers(text: &str, links: &[LinkInfo]) -> String {
+    let mut out = text.to_string();
+    for (idx, link) in links.iter().enumerate() {
+        if link.text.is_none() && !link.from_html {
+            continue;
+        }
+        let label = link_display_label(link, Some(idx));
+        let marker = format!("{LINK_MARK_START}{label}{LINK_MARK_END}");
+        let label_bracketed = format!("[{}]", label);
+        if out.contains(&label_bracketed) {
+            out = out.replace(
+                &label_bracketed,
+                &format!("{LINK_MARK_START}[{}]{LINK_MARK_END}", label),
+            );
+            continue;
+        }
+        let token = format!("{} [{}]", label, link.url);
+        if out.contains(&token) {
+            out = out.replace(&token, &marker);
+            continue;
+        }
+        let bracketed = format!("[{}]", link.url);
+        if out.contains(&bracketed) {
+            out = out.replace(&bracketed, &marker);
+            continue;
+        }
+        if link.from_html && label.starts_with("Image link ") && out.contains(&label) {
+            out = out.replace(&label, &marker);
+        }
+    }
+    out
+}
+
+fn spans_for_plain_text(text: &str, labels: &[String]) -> Vec<Span<'static>> {
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url, LinkKind::Email]);
+    let mut ranges: Vec<(usize, usize)> = finder
+        .links(text)
+        .map(|link| (link.start(), link.end()))
+        .collect();
+    ranges.extend(find_reference_links(text));
+    ranges.extend(find_label_ranges(text, labels));
+    if text.is_empty() {
+        vec![Span::raw(String::new())]
+    } else {
+        build_spans_with_ranges_owned(text, ranges)
+    }
+}
+
+fn find_label_ranges(text: &str, labels: &[String]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for label in labels {
+        let needle = format!("[{}]", label);
+        let mut start = 0usize;
+        while let Some(pos) = text[start..].find(&needle) {
+            let s = start + pos;
+            out.push((s, s + needle.len()));
+            start = s + needle.len();
+        }
+    }
+    out
 }
 
 fn copy_with_osc52(text: &str) -> bool {
@@ -3849,9 +3915,9 @@ fn find_reference_links(line: &str) -> Vec<(usize, usize)> {
     out
 }
 
-fn build_spans_with_ranges(line: &str, mut ranges: Vec<(usize, usize)>) -> Vec<Span<'_>> {
+fn build_spans_with_ranges_owned(line: &str, mut ranges: Vec<(usize, usize)>) -> Vec<Span<'static>> {
     if ranges.is_empty() {
-        return vec![Span::raw(line)];
+        return vec![Span::raw(line.to_string())];
     }
     ranges.sort_by_key(|(start, _)| *start);
     let mut merged: Vec<(usize, usize)> = Vec::new();
@@ -3870,33 +3936,46 @@ fn build_spans_with_ranges(line: &str, mut ranges: Vec<(usize, usize)>) -> Vec<S
     let mut last = 0usize;
     for (start, end) in merged {
         if start > last {
-            spans.push(Span::raw(&line[last..start]));
+            spans.push(Span::raw(line[last..start].to_string()));
         }
-        spans.push(Span::styled(&line[start..end], link_style()));
+        spans.push(Span::styled(line[start..end].to_string(), link_style()));
         last = end;
     }
     if last < line.len() {
-        spans.push(Span::raw(&line[last..]));
+        spans.push(Span::raw(line[last..].to_string()));
     }
     spans
 }
 
-fn text_with_link_style(text: &str) -> Text<'_> {
+fn text_with_link_style(text: &str, links: &[LinkInfo]) -> Text<'static> {
     let mut lines = Vec::new();
-    let mut finder = LinkFinder::new();
-    finder.kinds(&[LinkKind::Url, LinkKind::Email]);
+    let marked = apply_link_markers(text, links);
+    let labels: Vec<String> = links
+        .iter()
+        .enumerate()
+        .map(|(idx, link)| link_display_label(link, Some(idx)))
+        .collect();
 
-    for line in text.split('\n') {
-        let mut ranges: Vec<(usize, usize)> = finder
-            .links(line)
-            .map(|link| (link.start(), link.end()))
-            .collect();
-        ranges.extend(find_reference_links(line));
-        let spans = if line.is_empty() {
-            vec![Span::raw("")]
-        } else {
-            build_spans_with_ranges(line, ranges)
-        };
+    for line in marked.split('\n') {
+        let mut spans = Vec::new();
+        let mut rest = line;
+        while let Some(start) = rest.find(LINK_MARK_START) {
+            let before = &rest[..start];
+            spans.extend(spans_for_plain_text(before, &labels));
+            let after_start = start + LINK_MARK_START.len();
+            let Some(end_rel) = rest[after_start..].find(LINK_MARK_END) else {
+                spans.extend(spans_for_plain_text(&rest[start..], &labels));
+                rest = "";
+                break;
+            };
+            let end = after_start + end_rel;
+            let label = &rest[after_start..end];
+            spans.push(Span::styled(label.to_string(), link_style()));
+            rest = &rest[end + LINK_MARK_END.len()..];
+        }
+        if !rest.is_empty() {
+            spans.extend(spans_for_plain_text(rest, &labels));
+        }
         lines.push(Line::from(spans));
     }
 
@@ -3949,7 +4028,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                         Line::from("Or RATMAIL_CHROME_NO_SANDBOX=1"),
                     ])
                 } else if render_no_html {
-                    text_with_link_style(detail.body.as_str())
+                    text_with_link_style(detail.body.as_str(), &detail.links)
                 } else if render_tile_count == 0 && renderer_is_chromium {
                     Text::from(vec![
                         Line::from(""),
@@ -3967,7 +4046,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                     ])
                 }
             }
-            ViewMode::Text => text_with_link_style(detail.body.as_str()),
+            ViewMode::Text => text_with_link_style(detail.body.as_str(), &detail.links),
         };
 
         let content_block = Paragraph::new(content_text)
@@ -4180,16 +4259,17 @@ fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 .saturating_sub(6)
                 .max(1) as usize;
             for (idx, link) in detail.links.iter().enumerate().take(end).skip(start) {
-                let style = if idx == app.link_index {
+                let label = truncate_label(&link_display_label(link, Some(idx)), max_label);
+                let idx_text = format!("  {:>2}  ", idx + 1);
+                let label_style = if idx == app.link_index {
                     link_style().bg(Color::DarkGray)
                 } else {
                     link_style()
                 };
-                let label = truncate_label(&link_display_label(link, Some(idx)), max_label);
-                lines.push(Line::from(Span::styled(
-                    format!("  {:>2}  {}", idx + 1, label),
-                    style,
-                )));
+                let mut spans = Vec::new();
+                spans.push(Span::raw(idx_text));
+                spans.push(Span::styled(label, label_style));
+                lines.push(Line::from(spans));
             }
         }
     } else {

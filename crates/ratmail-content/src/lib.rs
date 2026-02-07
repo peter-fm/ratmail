@@ -31,20 +31,22 @@ pub fn extract_display(raw: &[u8], width_cols: usize) -> Result<DisplayText> {
     let parsed = mailparse::parse_mail(raw)?;
     let (body, is_html) = select_body(&parsed)?;
 
-    let (text, html_for_links, text_from_html) = if is_html {
+    let (text, html_for_links) = if is_html {
         let sanitized = sanitize_html(&body);
         let text = html2text::from_read(sanitized.as_bytes(), width_cols);
-        (text, Some(sanitized), true)
+        (text, Some(sanitized))
     } else if let Some(html) = find_html_part(&parsed)? {
         let sanitized = sanitize_html(&html);
-        (body, Some(sanitized), false)
+        (body, Some(sanitized))
     } else {
-        (body, None, false)
+        (body, None)
     };
 
     let text = html_escape::decode_html_entities(&text).to_string();
     let text = normalize_display_text(&text);
     let links = extract_links(&text, html_for_links.as_deref());
+    let text = normalize_bracketed_urls(&text);
+    let text = replace_link_urls_with_labels(&text, &links);
 
     Ok(DisplayText { text, links })
 }
@@ -554,6 +556,116 @@ fn strip_html_tags(input: &str) -> String {
     out
 }
 
+fn link_label_for_text(links: &[LinkInfo], idx: usize) -> Option<String> {
+    let link = links.get(idx)?;
+    if let Some(text) = link.text.as_deref() {
+        return Some(text.to_string());
+    }
+    if link.from_html {
+        return Some(format!("Image Link {}", idx + 1));
+    }
+    None
+}
+
+fn normalize_bracketed_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '[' {
+            out.push(ch);
+            continue;
+        }
+        let mut buf = String::new();
+        let mut found_end = false;
+        while let Some(next) = chars.next() {
+            if next == ']' {
+                found_end = true;
+                break;
+            }
+            if next != '\n' && next != '\r' {
+                buf.push(next);
+            }
+        }
+        if found_end {
+            let trimmed = buf.trim();
+            if trimmed.starts_with("http://")
+                || trimmed.starts_with("https://")
+                || trimmed.starts_with("mailto:")
+            {
+                out.push('[');
+                out.push_str(trimmed);
+                out.push(']');
+            } else {
+                out.push('[');
+                out.push_str(&buf);
+                out.push(']');
+            }
+        } else {
+            out.push('[');
+            out.push_str(&buf);
+        }
+    }
+    out
+}
+
+fn replace_link_urls_with_labels(text: &str, links: &[LinkInfo]) -> String {
+    if links.is_empty() {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    for (idx, link) in links.iter().enumerate() {
+        let Some(label) = link_label_for_text(links, idx) else {
+            continue;
+        };
+        let label_bracketed = format!("[{}]", label);
+        let bracketed = format!("[{}]", link.url);
+        let token = format!("{} {}", label, bracketed);
+        if out.contains(&token) {
+            out = out.replace(&token, &label_bracketed);
+            continue;
+        }
+        let token = format!("{}\n{}", label, bracketed);
+        if out.contains(&token) {
+            out = out.replace(&token, &label_bracketed);
+            continue;
+        }
+        if out.contains(&bracketed) {
+            out = out.replace(&bracketed, &label_bracketed);
+        }
+    }
+    out
+}
+
+fn normalize_bracketed_labels(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '[' {
+            out.push(ch);
+            continue;
+        }
+        let mut buf = String::new();
+        let mut found_end = false;
+        while let Some(next) = chars.next() {
+            if next == ']' {
+                found_end = true;
+                break;
+            }
+            buf.push(next);
+        }
+        if found_end {
+            let trimmed = buf.trim();
+            out.push('[');
+            out.push_str(trimmed);
+            out.push(']');
+        } else {
+            out.push('[');
+            out.push_str(&buf);
+        }
+    }
+    out
+}
+
 fn normalize_display_text(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -588,7 +700,7 @@ fn normalize_display_text(text: &str) -> String {
         }
     }
 
-    out_lines.join("\n")
+    normalize_bracketed_labels(&out_lines.join("\n"))
 }
 
 fn is_horizontal_rule(trimmed: &str) -> bool {
