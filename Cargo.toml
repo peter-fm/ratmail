@@ -14,6 +14,7 @@ ammonia = "3.3"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 html2text = "0.12"
+html-escape = "0.2"
 linkify = "0.10"
 mailparse = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

@@ -31,17 +31,18 @@ pub fn extract_display(raw: &[u8], width_cols: usize) -> Result<DisplayText> {
     let parsed = mailparse::parse_mail(raw)?;
     let (body, is_html) = select_body(&parsed)?;
 
-    let (text, html_for_links) = if is_html {
+    let (text, html_for_links, text_from_html) = if is_html {
         let sanitized = sanitize_html(&body);
         let text = html2text::from_read(sanitized.as_bytes(), width_cols);
-        (text, Some(sanitized))
+        (text, Some(sanitized), true)
     } else if let Some(html) = find_html_part(&parsed)? {
         let sanitized = sanitize_html(&html);
-        (body, Some(sanitized))
+        (body, Some(sanitized), false)
     } else {
-        (body, None)
+        (body, None, false)
     };
 
+    let text = html_escape::decode_html_entities(&text).to_string();
     let text = normalize_display_text(&text);
     let links = extract_links(&text, html_for_links.as_deref());
 
