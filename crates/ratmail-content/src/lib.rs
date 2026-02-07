@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
 use base64::Engine;
@@ -6,12 +6,12 @@ use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use linkify::{LinkFinder, LinkKind};
 use mailparse::{MailHeaderMap, ParsedMail};
 
-use ratmail_core::AttachmentMeta;
+use ratmail_core::{AttachmentMeta, LinkInfo};
 
 #[derive(Debug, Clone)]
 pub struct DisplayText {
     pub text: String,
-    pub links: Vec<String>,
+    pub links: Vec<LinkInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,9 +32,12 @@ pub fn extract_display(raw: &[u8], width_cols: usize) -> Result<DisplayText> {
     let (body, is_html) = select_body(&parsed)?;
 
     let (text, html_for_links) = if is_html {
-        let sanitized = ammonia::clean(&body);
+        let sanitized = sanitize_html(&body);
         let text = html2text::from_read(sanitized.as_bytes(), width_cols);
         (text, Some(sanitized))
+    } else if let Some(html) = find_html_part(&parsed)? {
+        let sanitized = sanitize_html(&html);
+        (body, Some(sanitized))
     } else {
         (body, None)
     };
@@ -369,15 +372,25 @@ fn block_remote_css_urls(html: &str) -> (String, usize) {
     (out, count)
 }
 
-fn extract_links(text: &str, html: Option<&str>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
+fn extract_links(text: &str, html: Option<&str>) -> Vec<LinkInfo> {
+    let mut out: Vec<LinkInfo> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
 
     if let Some(html) = html {
-        for link in extract_href_links(html) {
-            if seen.insert(link.clone()) {
-                out.push(link);
+        for (url, text) in extract_href_links_with_text(html) {
+            let normalized = normalize_link_text(&text);
+            if let Some(idx) = seen.get(&url).copied() {
+                if out[idx].text.is_none() && normalized.is_some() {
+                    out[idx].text = normalized;
+                }
+                continue;
             }
+            out.push(LinkInfo {
+                url: url.clone(),
+                text: normalized,
+                from_html: true,
+            });
+            seen.insert(url, out.len() - 1);
         }
     }
 
@@ -385,66 +398,158 @@ fn extract_links(text: &str, html: Option<&str>) -> Vec<String> {
     finder.kinds(&[LinkKind::Url]);
     for link in finder.links(text) {
         let url = link.as_str().to_string();
-        if seen.insert(url.clone()) {
-            out.push(url);
+        if seen.contains_key(&url) {
+            continue;
         }
+        out.push(LinkInfo {
+            url: url.clone(),
+            text: None,
+            from_html: false,
+        });
+        seen.insert(url, out.len() - 1);
     }
 
     out
 }
 
-fn extract_href_links(html: &str) -> Vec<String> {
+fn extract_href_links_with_text(html: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut in_href = false;
-    let mut quote: Option<char> = None;
+    let lower = html.to_ascii_lowercase();
+    let mut idx = 0usize;
 
-    for ch in html.chars() {
-        if !in_href {
-            if ch == 'h' {
-                buf.clear();
-            }
-            buf.push(ch);
-            if buf.ends_with("href=") {
-                in_href = true;
-                buf.clear();
-            }
-            if buf.len() > 5 {
-                buf.remove(0);
-            }
-            continue;
-        }
-
-        if quote.is_none() {
-            if ch == '"' || ch == '\'' {
-                quote = Some(ch);
+    while let Some(pos) = lower[idx..].find("<a") {
+        let start = idx + pos;
+        let tag_end = match lower[start..].find('>') {
+            Some(rel) => start + rel,
+            None => break,
+        };
+        let tag = &lower[start..=tag_end];
+        let href_pos = match tag.find("href=") {
+            Some(pos) => start + pos + 5,
+            None => {
+                idx = tag_end + 1;
                 continue;
             }
-            if ch.is_whitespace() {
-                in_href = false;
+        };
+
+        let mut j = href_pos;
+        let bytes = html.as_bytes();
+        while j < html.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let mut quote: Option<char> = None;
+        if j < html.len() && (bytes[j] == b'\'' || bytes[j] == b'"') {
+            quote = Some(bytes[j] as char);
+            j += 1;
+        }
+        let url_start = j;
+        let url_end = if let Some(q) = quote {
+            match html[url_start..].find(q) {
+                Some(rel) => url_start + rel,
+                None => {
+                    idx = tag_end + 1;
+                    continue;
+                }
+            }
+        } else {
+            match html[url_start..].find(|c: char| c.is_whitespace() || c == '>') {
+                Some(rel) => url_start + rel,
+                None => {
+                    idx = tag_end + 1;
+                    continue;
+                }
+            }
+        };
+        let url = html[url_start..url_end].trim().to_string();
+        let tag_original = &html[start..=tag_end];
+
+        let close_tag = match lower[tag_end + 1..].find("</a") {
+            Some(rel) => tag_end + 1 + rel,
+            None => {
+                out.push((url, String::new()));
+                idx = tag_end + 1;
                 continue;
             }
-            buf.push(ch);
-            continue;
-        }
+        };
+        let inner = html[tag_end + 1..close_tag].to_string();
+        let text = best_link_text(tag_original, &inner);
+        out.push((url, text));
+        idx = close_tag + 4;
+    }
 
-        if Some(ch) == quote {
-            if !buf.is_empty() {
-                out.push(buf.clone());
+    out
+}
+
+fn normalize_link_text(text: &str) -> Option<String> {
+    let stripped = strip_html_tags(text);
+    let mut out = String::new();
+    for part in stripped.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn best_link_text(tag: &str, inner: &str) -> String {
+    if let Some(text) = normalize_link_text(inner) {
+        return text;
+    }
+    if let Some(text) = extract_attr_value(tag, "aria-label")
+        .or_else(|| extract_attr_value(tag, "title"))
+    {
+        return text;
+    }
+    if let Some(text) = extract_attr_value(inner, "alt")
+        .or_else(|| extract_attr_value(inner, "title"))
+    {
+        return text;
+    }
+    String::new()
+}
+
+fn extract_attr_value(input: &str, name: &str) -> Option<String> {
+    let lower = input.to_ascii_lowercase();
+    let needle = format!("{}=", name);
+    let pos = lower.find(&needle)?;
+    let mut i = pos + needle.len();
+    while i < input.len() && input.as_bytes()[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= input.len() {
+        return None;
+    }
+    let quote = input.as_bytes()[i];
+    if quote != b'\'' && quote != b'\"' {
+        return None;
+    }
+    i += 1;
+    let start = i;
+    while i < input.len() && input.as_bytes()[i] != quote {
+        i += 1;
+    }
+    if i <= start {
+        return None;
+    }
+    let value = input[start..i].trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ => {
+                if !in_tag {
+                    out.push(ch);
+                }
             }
-            buf.clear();
-            in_href = false;
-            quote = None;
-            continue;
         }
-
-        buf.push(ch);
     }
-
-    if in_href && !buf.is_empty() {
-        out.push(buf);
-    }
-
     out
 }
 

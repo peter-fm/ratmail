@@ -50,8 +50,15 @@ pub struct MessageDetail {
     pub from: String,
     pub date: String,
     pub body: String,
-    pub links: Vec<String>,
+    pub links: Vec<LinkInfo>,
     pub attachments: Vec<AttachmentMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinkInfo {
+    pub url: String,
+    pub text: Option<String>,
+    pub from_html: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

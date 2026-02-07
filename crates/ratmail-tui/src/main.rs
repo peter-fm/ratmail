@@ -35,8 +35,8 @@ use ratmail_content::{
     extract_attachment_data, extract_attachments, extract_display, prepare_html,
 };
 use ratmail_core::{
-    DEFAULT_TEXT_WIDTH, Folder, FolderSyncState, MailStore, MessageDetail, MessageSummary,
-    SqliteMailStore, StoreSnapshot, TileMeta,
+    DEFAULT_TEXT_WIDTH, Folder, FolderSyncState, LinkInfo, MailStore, MessageDetail,
+    MessageSummary, SqliteMailStore, StoreSnapshot, TileMeta,
 };
 use ratmail_mail::{
     ImapConfig, MailCommand, MailEngine, MailEvent, OutgoingAttachment, SmtpConfig,
@@ -243,6 +243,7 @@ enum Mode {
     OverlayBulkAction,
     OverlayBulkMove,
     OverlayConfirmDelete,
+    OverlayConfirmLink,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +358,9 @@ struct App {
     bulk_done_return: Mode,
     confirm_delete_ids: Vec<i64>,
     confirm_delete_return: Mode,
+    confirm_link: Option<LinkInfo>,
+    confirm_link_external: bool,
+    confirm_link_return: Mode,
     picker_mode: Option<PickerMode>,
     picker_focus: PickerFocus,
     picker: Option<FileExplorer>,
@@ -524,6 +528,9 @@ impl App {
             bulk_done_return: Mode::View,
             confirm_delete_ids: Vec::new(),
             confirm_delete_return: Mode::View,
+            confirm_link: None,
+            confirm_link_external: false,
+            confirm_link_return: Mode::View,
             picker_mode: None,
             picker_focus: PickerFocus::Explorer,
             picker: None,
@@ -693,6 +700,13 @@ impl App {
         self.confirm_delete_return = return_mode;
         self.overlay_return = return_mode;
         self.mode = Mode::OverlayConfirmDelete;
+    }
+
+    fn open_confirm_link(&mut self, link: LinkInfo, external: bool, return_mode: Mode) {
+        self.confirm_link = Some(link);
+        self.confirm_link_external = external;
+        self.confirm_link_return = return_mode;
+        self.mode = Mode::OverlayConfirmLink;
     }
 
     fn collect_imap_uids(&self, ids: &[i64]) -> Vec<u32> {
@@ -940,7 +954,8 @@ impl App {
             | Mode::OverlayAttach
             | Mode::OverlayBulkAction
             | Mode::OverlayBulkMove
-            | Mode::OverlayConfirmDelete => self.on_key_overlay(key),
+            | Mode::OverlayConfirmDelete
+            | Mode::OverlayConfirmLink => self.on_key_overlay(key),
         }
     }
 
@@ -1904,6 +1919,43 @@ impl App {
         false
     }
 
+    fn link_is_raw(link: &LinkInfo) -> bool {
+        if let Some(text) = link.text.as_deref() {
+            return text.trim() == link.url.trim();
+        }
+        !link.from_html
+    }
+
+    fn open_link_raw(&mut self, link: &str, _external: bool) {
+        if let Some((to, subject, body)) = parse_mailto(link) {
+            self.start_compose_to(to, subject, body);
+        } else if looks_like_email(link) {
+            self.start_compose_to(link.to_string(), None, None);
+        } else {
+            let _ = open::that(link);
+        }
+    }
+
+    fn open_link_action(&mut self, link: &LinkInfo, external: bool) {
+        if Self::link_is_raw(link) {
+            self.open_link_raw(&link.url, external);
+        } else {
+            self.open_confirm_link(link.clone(), external, self.mode);
+        }
+    }
+
+    fn copy_to_clipboard(&mut self, text: &str) {
+        if copy_with_osc52(text) {
+            self.status_message = Some("Copied link".to_string());
+            return;
+        }
+        if copy_with_command(text) {
+            self.status_message = Some("Copied link".to_string());
+            return;
+        }
+        self.status_message = Some("Clipboard copy failed".to_string());
+    }
+
     fn on_key_overlay(&mut self, key: KeyEvent) -> bool {
         match self.mode {
             Mode::OverlayLinks => match key.code {
@@ -1925,15 +1977,48 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(detail) = self.selected_detail() {
                         if let Some(link) = detail.links.get(self.link_index) {
-                            if let Some((to, subject, body)) = parse_mailto(link) {
-                                self.start_compose_to(to, subject, body);
-                            } else if looks_like_email(link) {
-                                self.start_compose_to(link.to_string(), None, None);
-                            } else {
-                                let _ = open::that(link);
-                            }
+                            let link = link.clone();
+                            self.open_link_action(&link, false);
                         }
                     }
+                }
+                KeyCode::Char('o') => {
+                    if let Some(detail) = self.selected_detail() {
+                        if let Some(link) = detail.links.get(self.link_index) {
+                            let link = link.clone();
+                            self.open_link_action(&link, true);
+                        }
+                    }
+                }
+                KeyCode::Char('y') => {
+                    if let Some(detail) = self.selected_detail() {
+                        if let Some(link) = detail.links.get(self.link_index) {
+                            let url = link.url.clone();
+                            self.copy_to_clipboard(&url);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Mode::OverlayConfirmLink => match key.code {
+                KeyCode::Esc => {
+                    self.confirm_link = None;
+                    self.mode = self.confirm_link_return;
+                }
+                KeyCode::Char('q') => return true,
+                KeyCode::Char('y') => {
+                    if let Some(link) = self.confirm_link.clone() {
+                        let external = self.confirm_link_external;
+                        self.confirm_link = None;
+                        self.mode = self.confirm_link_return;
+                        self.open_link_raw(&link.url, external);
+                    } else {
+                        self.mode = self.confirm_link_return;
+                    }
+                }
+                KeyCode::Char('n') => {
+                    self.confirm_link = None;
+                    self.mode = self.confirm_link_return;
                 }
                 _ => {}
             },
@@ -3411,6 +3496,7 @@ fn ui(frame: &mut ratatui::Frame, multi: &mut MultiApp) {
         Mode::OverlayBulkAction => render_bulk_action_overlay(frame, area, app),
         Mode::OverlayBulkMove => render_bulk_move_overlay(frame, area, app),
         Mode::OverlayConfirmDelete => render_confirm_delete_overlay(frame, area, app),
+        Mode::OverlayConfirmLink => render_confirm_link_overlay(frame, area, app),
         Mode::Compose => render_compose_overlay(frame, area, app),
         Mode::ViewFocus => render_view_focus(frame, area, app),
         _ => {}
@@ -3671,6 +3757,57 @@ fn link_style() -> Style {
     Style::default()
         .fg(Color::LightBlue)
         .add_modifier(Modifier::UNDERLINED)
+}
+
+fn link_display_label(link: &LinkInfo, index: Option<usize>) -> String {
+    if let Some(text) = link.text.as_deref() {
+        return text.to_string();
+    }
+    if link.from_html {
+        if let Some(idx) = index {
+            return format!("Image link {}", idx + 1);
+        }
+        return "Image link".to_string();
+    }
+    link.url.clone()
+}
+
+fn copy_with_osc52(text: &str) -> bool {
+    let b64 = BASE64_STANDARD.encode(text.as_bytes());
+    let seq = format!("\x1b]52;c;{}\x07", b64);
+    if io::stdout().write_all(seq.as_bytes()).is_ok() && io::stdout().flush().is_ok() {
+        return true;
+    }
+    false
+}
+
+fn copy_with_command(text: &str) -> bool {
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("pbcopy", &[]),
+        ("clip", &[]),
+    ];
+    for (cmd, args) in candidates {
+        let mut child = match std::process::Command::new(cmd)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            if stdin.write_all(text.as_bytes()).is_err() {
+                continue;
+            }
+        }
+        if child.wait().map(|s| s.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
 
 fn find_reference_links(line: &str) -> Vec<(usize, usize)> {
@@ -4000,6 +4137,15 @@ fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let popup = centered_rect(80, 60, area);
     frame.render_widget(Clear, popup);
 
+    let block = Block::default().borders(Borders::ALL).title("LINKS");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner);
+
     let mut lines = Vec::new();
     let title = app
         .selected_detail()
@@ -4012,14 +4158,36 @@ fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         if detail.links.is_empty() {
             lines.push(Line::from("  (no links found)"));
         } else {
-            for (idx, link) in detail.links.iter().enumerate() {
+            let max_lines = rows[0].height as usize;
+            let header_lines = 2usize;
+            let list_capacity = max_lines.saturating_sub(header_lines);
+            let total = detail.links.len();
+            let mut start = 0usize;
+            if list_capacity > 0 && app.link_index + 1 > list_capacity {
+                start = app.link_index + 1 - list_capacity;
+                if start + list_capacity > total {
+                    start = total.saturating_sub(list_capacity);
+                }
+            }
+            let end = if list_capacity == 0 {
+                0
+            } else {
+                (start + list_capacity).min(total)
+            };
+
+            let max_label = rows[0]
+                .width
+                .saturating_sub(6)
+                .max(1) as usize;
+            for (idx, link) in detail.links.iter().enumerate().take(end).skip(start) {
                 let style = if idx == app.link_index {
                     link_style().bg(Color::DarkGray)
                 } else {
                     link_style()
                 };
+                let label = truncate_label(&link_display_label(link, Some(idx)), max_label);
                 lines.push(Line::from(Span::styled(
-                    format!("  {:>2}  {}", idx + 1, link),
+                    format!("  {:>2}  {}", idx + 1, label),
                     style,
                 )));
             }
@@ -4028,14 +4196,25 @@ fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         lines.push(Line::from("  (no message selected)"));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from("Enter open  y copy  o open ext  Esc close"));
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, rows[0]);
 
-    let block = Block::default().borders(Borders::ALL).title("LINKS");
-    let paragraph = Paragraph::new(Text::from(lines))
-        .block(block)
+    let footer = Paragraph::new("Enter open  y copy  o open ext  Esc close")
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, popup);
+    frame.render_widget(footer, rows[1]);
+}
+
+fn truncate_label(label: &str, max_len: usize) -> String {
+    let mut text = label.replace('\n', " ").replace('\r', " ");
+    if text.len() <= max_len {
+        return text;
+    }
+    if max_len <= 3 {
+        return text.chars().take(max_len).collect();
+    }
+    text.truncate(max_len - 3);
+    text.push_str("...");
+    text
 }
 
 fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
@@ -4143,6 +4322,34 @@ fn render_confirm_delete_overlay(frame: &mut ratatui::Frame, area: Rect, app: &A
         count,
         if count == 1 { "" } else { "s" }
     )));
+    lines.push(Line::from(""));
+    lines.push(Line::from("y confirm"));
+    lines.push(Line::from("n cancel"));
+    lines.push(Line::from("Esc close"));
+
+    let block = Block::default().borders(Borders::ALL).title("CONFIRM");
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_confirm_link_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let popup = centered_rect(70, 40, area);
+    frame.render_widget(Clear, popup);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from("Open link?"));
+    lines.push(Line::from(""));
+    if let Some(link) = &app.confirm_link {
+        let display = link_display_label(link, None);
+        if display != link.url {
+            lines.push(Line::from(format!("Text: {}", display)));
+        }
+        lines.push(Line::from(format!("URL: {}", link.url)));
+    } else {
+        lines.push(Line::from("URL: (none)"));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from("y confirm"));
     lines.push(Line::from("n cancel"));
