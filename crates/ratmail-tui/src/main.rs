@@ -1816,6 +1816,9 @@ impl App {
             (KeyCode::Char('o'), _) => {
                 self.request_backfill_selected_folder();
             }
+            (KeyCode::Char('s'), _) => {
+                self.request_sync_selected_folder();
+            }
             _ => {}
         }
         false
@@ -1898,6 +1901,9 @@ impl App {
             }
             (KeyCode::Char('o'), _) => {
                 self.request_backfill_selected_folder();
+            }
+            (KeyCode::Char('s'), _) => {
+                self.request_sync_selected_folder();
             }
             (KeyCode::Esc, _) => {
                 self.mode = Mode::View;
@@ -4186,12 +4192,12 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
 fn render_help_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let mut help = if app.show_help {
         String::from(
-            "Tab/h/l focus  j/k move  Space select+next  Enter open/actions  v toggle view  p preview  o older  [ ] switch acct  ? help  Esc clear\n\
+            "Tab/h/l focus  j/k move  Space select+next  Enter open/actions  v toggle view  p preview  s sync  o older  [ ] switch acct  ? help  Esc clear\n\
 Ctrl+S/F5 send  r reply  R reply-all  f forward  m move  d delete  q quit",
         )
     } else {
         String::from(
-            "Tab/h/l focus  j/k move  Space select+next  Enter open/actions  v view  p preview  o older  [ ] acct  ? help  Esc clear  q quit",
+            "Tab/h/l focus  j/k move  Space select+next  Enter open/actions  v view  p preview  s sync  o older  [ ] acct  ? help  Esc clear  q quit",
         )
     };
     if let Some(msg) = &app.status_message {

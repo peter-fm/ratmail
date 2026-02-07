@@ -109,6 +109,7 @@ Notes:
 - `Enter`: open message
 - `v`: toggle rendered/text view
 - `p`: toggle preview pane
+- `s`: sync selected folder (check for new mail)
 - `o`: load older messages (backfill)
 - `?`: toggle help
 - `q`: quit
