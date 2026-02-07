@@ -47,13 +47,13 @@ cargo run --example file_preview
 # Basic usage
 Install the libraries in your `Cargo.toml` file:
 ```plaintext
-cargo add ratatui ratatui-explorer crossterm
+cargo add ratatui ratatui-explorer
 ```
 Then inside your `main.rs` file:
 ```rust no_run
 use std::io::{self, stdout};
 
-use crossterm::{
+use ratatui::crossterm::{
     event::{read, Event, KeyCode},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
@@ -75,7 +75,7 @@ fn main() -> io::Result<()> {
     loop {
         // Render the file explorer widget.
         terminal.draw(|f| {
-            f.render_widget(&file_explorer.widget(), f.area());
+            f.render_widget(file_explorer.widget(), f.area());
         })?;
 
         // Read the next event from the terminal.

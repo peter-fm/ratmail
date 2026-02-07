@@ -41,6 +41,7 @@ mode = "readonly"
 default_account = "Personal"
 
 [cli.acl]
+# If [cli.acl] is omitted, reads are unscoped by account or folder.
 accounts = ["Personal"]
 folders = ["INBOX"]
 from_allow = ["*@example.com"]

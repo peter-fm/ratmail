@@ -134,9 +134,12 @@ Security notes:
 - Use `from_allow`, `fields`, and a minimal `allow_commands` list to reduce prompt-injection surface for agents.
 - `mode = "readonly"` blocks all mutations. `readonly-full-access` allows full read (including bodies/raw/attachments). `full-access` enables mutations if allowed by ACL.
 - CLI remains disabled unless `enabled = true` is set.
+- If you set `enabled = true` without an ACL, reads are not scoped by account or folder (headers only, no bodies unless explicitly allowed).
 - CLI outputs include a `schema` field (currently `ratmail.cli.v1`) for stable parsing.
 - `--fetch` pulls raw bodies from IMAP when not cached (requires IMAP + UID); otherwise body/raw may be empty.
 - `--wait` waits for a best-effort completion signal (IMAP fetch events). It is not a hard guarantee that every message is synced.
+
+Rationale: the defaults prioritize safety. The CLI is off by default, and `readonly` mode limits both mutations and the default fields to reduce unintended data exposure. Explicit ACLs are required to safely scope access once the CLI is enabled.
 
 Preset: Agent-safe (locked down)
 

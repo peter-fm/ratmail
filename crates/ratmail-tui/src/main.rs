@@ -5523,6 +5523,70 @@ fn matches_any_pattern(patterns: &[String], value: &str) -> bool {
     patterns.iter().any(|p| wildcard_match(p, value))
 }
 
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn cfg_with(mode: CliMode) -> CliConfig {
+        CliConfig {
+            enabled: true,
+            mode,
+            default_account: None,
+            acl: CliAcl::default(),
+        }
+    }
+
+    #[test]
+    fn readonly_defaults_to_header_fields() {
+        let cfg = cfg_with(CliMode::Readonly);
+        let fields = allowed_fields(&cfg);
+        let expected: HashSet<String> = [
+            "id",
+            "folder_id",
+            "date",
+            "from",
+            "subject",
+            "unread",
+        ]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(fields, expected);
+    }
+
+    #[test]
+    fn readonly_blocks_mutation_even_without_allow_list() {
+        let cfg = cfg_with(CliMode::Readonly);
+        assert!(acl_allows_command(&cfg, "messages.list", false));
+        assert!(!acl_allows_command(&cfg, "send", true));
+    }
+
+    #[test]
+    fn allow_commands_restricts_non_matching_commands() {
+        let mut cfg = cfg_with(CliMode::Readonly);
+        cfg.acl.allow_commands = Some(vec!["messages.*".to_string()]);
+        assert!(acl_allows_command(&cfg, "messages.list", false));
+        assert!(!acl_allows_command(&cfg, "folders.list", false));
+    }
+
+    #[test]
+    fn readonly_can_enable_body_field_explicitly() {
+        let mut cfg = cfg_with(CliMode::Readonly);
+        cfg.acl.allow_body = Some(true);
+        let fields = allowed_fields(&cfg);
+        assert!(fields.contains("body"));
+        assert!(!fields.contains("raw"));
+    }
+
+    #[test]
+    fn full_access_allows_send_by_default() {
+        let cfg = cfg_with(CliMode::FullAccess);
+        assert!(acl_allows_command(&cfg, "send", true));
+        assert!(acl_allows_send(&cfg));
+    }
+}
+
 fn wildcard_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return true;
