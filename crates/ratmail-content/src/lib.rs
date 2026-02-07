@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
-use anyhow::{anyhow, Result};
-use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use anyhow::{Result, anyhow};
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use linkify::{LinkFinder, LinkKind};
 use mailparse::{MailHeaderMap, ParsedMail};
 
@@ -217,10 +217,12 @@ fn find_html_part(parsed: &ParsedMail) -> Result<Option<String>> {
 fn collect_cid_map(parsed: &ParsedMail) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     walk_parts(parsed, &mut |part| {
-        let cid = part
-            .headers
-            .get_first_value("Content-ID")
-            .map(|v| v.trim().trim_start_matches('<').trim_end_matches('>').to_string());
+        let cid = part.headers.get_first_value("Content-ID").map(|v| {
+            v.trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string()
+        });
         if cid.is_none() {
             return;
         }
@@ -249,7 +251,12 @@ fn inline_cid_images(html: &str, cid_map: &[(String, String)]) -> String {
 fn block_remote_images(html: &str) -> (String, usize) {
     let mut out = html.to_string();
     let mut count = 0;
-    for prefix in ["src=\"http://", "src=\"https://", "src='http://", "src='https://"] {
+    for prefix in [
+        "src=\"http://",
+        "src=\"https://",
+        "src='http://",
+        "src='https://",
+    ] {
         let mut idx = 0;
         while let Some(pos) = out[idx..].find(prefix) {
             let start = idx + pos;

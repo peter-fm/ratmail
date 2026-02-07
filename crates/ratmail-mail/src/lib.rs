@@ -1,14 +1,14 @@
 //! Mail protocol integration (IMAP/SMTP) skeleton.
 
-use anyhow::{anyhow, Result};
-use lettre::{
-    message::{header::ContentType, Attachment, Mailbox, Message, MultiPart, SinglePart},
-    transport::smtp::authentication::Credentials,
-    AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
-};
-use mailparse::{addrparse, MailAddr};
-use imap::{ClientBuilder, ConnectionMode};
+use anyhow::{Result, anyhow};
 use chrono::{Datelike, Duration, Local, TimeZone};
+use imap::{ClientBuilder, ConnectionMode};
+use lettre::{
+    AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
+    message::{Attachment, Mailbox, Message, MultiPart, SinglePart, header::ContentType},
+    transport::smtp::authentication::Credentials,
+};
+use mailparse::{MailAddr, addrparse};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
@@ -24,9 +24,15 @@ pub enum MailCommand {
         folder_name: String,
         uid: u32,
     },
-    SetFlag { message_id: i64, seen: bool },
+    SetFlag {
+        message_id: i64,
+        seen: bool,
+    },
     SyncAll,
-    SyncFolderByName { name: String, mode: SyncMode },
+    SyncFolderByName {
+        name: String,
+        mode: SyncMode,
+    },
     SendMessage {
         to: String,
         cc: String,
@@ -48,16 +54,32 @@ pub enum SyncMode {
 pub enum MailEvent {
     SyncStarted(i64),
     SyncCompleted(i64),
-    SyncFailed { folder_id: i64, reason: String },
+    SyncFailed {
+        folder_id: i64,
+        reason: String,
+    },
     BodyFetched(i64),
-    FlagUpdated { message_id: i64, seen: bool },
+    FlagUpdated {
+        message_id: i64,
+        seen: bool,
+    },
     ImapFolders(Vec<ImapFolder>),
-    ImapMessages { folder_name: String, messages: Vec<ImapMessageSummary> },
-    ImapBody { message_id: i64, raw: Vec<u8> },
-    ImapError { reason: String },
+    ImapMessages {
+        folder_name: String,
+        messages: Vec<ImapMessageSummary>,
+    },
+    ImapBody {
+        message_id: i64,
+        raw: Vec<u8>,
+    },
+    ImapError {
+        reason: String,
+    },
     SendStarted,
     SendCompleted,
-    SendFailed { reason: String },
+    SendFailed {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,8 +134,7 @@ fn log_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".local").join("state"))
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
         })
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     Some(base.join("ratmail").join("ratmail.log"))
@@ -123,7 +144,8 @@ fn log_debug(msg: &str) {
     let Some(path) = log_path() else { return };
     let lock = LOG_FILE.get_or_init(|| {
         let _ = std::fs::create_dir_all(
-            path.parent().unwrap_or_else(|| std::path::Path::new("/tmp")),
+            path.parent()
+                .unwrap_or_else(|| std::path::Path::new("/tmp")),
         );
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -212,16 +234,9 @@ impl MailEngine {
                         attachments,
                     } => {
                         let _ = evt_tx.send(MailEvent::SendStarted);
-                        let result = send_smtp(
-                            smtp.clone(),
-                            &to,
-                            &cc,
-                            &bcc,
-                            &subject,
-                            &body,
-                            &attachments,
-                        )
-                        .await;
+                        let result =
+                            send_smtp(smtp.clone(), &to, &cc, &bcc, &subject, &body, &attachments)
+                                .await;
                         match result {
                             Ok(()) => {
                                 let _ = evt_tx.send(MailEvent::SendCompleted);
@@ -282,8 +297,7 @@ async fn send_smtp(
             let mime = ContentType::parse(&attachment.mime)
                 .unwrap_or_else(|_| ContentType::parse("application/octet-stream").unwrap());
             multipart = multipart.singlepart(
-                Attachment::new(attachment.filename.clone())
-                    .body(attachment.data.clone(), mime),
+                Attachment::new(attachment.filename.clone()).body(attachment.data.clone(), mime),
             );
         }
         builder.multipart(multipart)?
@@ -580,7 +594,10 @@ fn fetch_imap_messages(
                 .map(|d| format_date_display(&d))
                 .unwrap_or_default();
             let from = header_value(headers, "From").unwrap_or_default();
-            let unread = !fetch.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen));
+            let unread = !fetch
+                .flags()
+                .iter()
+                .any(|f| matches!(f, imap::types::Flag::Seen));
             messages.push(ImapMessageSummary {
                 uid,
                 date,
@@ -606,7 +623,6 @@ fn fetch_imap_body(imap: &ImapConfig, folder: &str, uid: u32) -> Result<Vec<u8>>
     let _ = session.logout();
     Ok(body)
 }
-
 
 fn header_value(raw: &[u8], name: &str) -> Option<String> {
     let (headers, _) = mailparse::parse_headers(raw).ok()?;
@@ -652,7 +668,10 @@ fn format_date_display(raw: &str) -> String {
 }
 
 fn imap_date_from_ts(ts: i64) -> String {
-    let dt = Local.timestamp_opt(ts, 0).single().unwrap_or_else(|| Local.timestamp_opt(0, 0).unwrap());
+    let dt = Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .unwrap_or_else(|| Local.timestamp_opt(0, 0).unwrap());
     imap_date_from_parts(dt.year(), dt.month(), dt.day())
 }
 

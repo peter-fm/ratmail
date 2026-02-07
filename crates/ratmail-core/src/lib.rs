@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mailparse::dateparse;
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
@@ -89,8 +89,12 @@ pub trait MailStore: Send + Sync {
     async fn upsert_raw_body(&self, message_id: i64, raw: &[u8]) -> Result<()>;
     async fn upsert_cache_text(&self, message_id: i64, width_cols: i64, text: &str) -> Result<()>;
     async fn get_cache_html(&self, message_id: i64, remote_policy: &str) -> Result<Option<String>>;
-    async fn upsert_cache_html(&self, message_id: i64, remote_policy: &str, html: &str)
-        -> Result<()>;
+    async fn upsert_cache_html(
+        &self,
+        message_id: i64,
+        remote_policy: &str,
+        html: &str,
+    ) -> Result<()>;
     async fn get_cache_tiles(
         &self,
         message_id: i64,
@@ -151,20 +155,26 @@ impl SqliteMailStore {
     }
 
     pub async fn clear_account_data(&self, account_id: i64) -> Result<()> {
-        let message_ids: Vec<i64> = sqlx::query_as::<_, (i64,)>(
-            "SELECT id FROM messages WHERE account_id = ?",
-        )
-        .bind(account_id)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|row| row.0)
-        .collect();
+        let message_ids: Vec<i64> =
+            sqlx::query_as::<_, (i64,)>("SELECT id FROM messages WHERE account_id = ?")
+                .bind(account_id)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| row.0)
+                .collect();
 
         if !message_ids.is_empty() {
-            let placeholders = message_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let placeholders = message_ids
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
             for table in ["bodies", "cache_text", "cache_html", "cache_tiles"] {
-                let query = format!("DELETE FROM {} WHERE message_id IN ({})", table, placeholders);
+                let query = format!(
+                    "DELETE FROM {} WHERE message_id IN ({})",
+                    table, placeholders
+                );
                 let mut q = sqlx::query(&query);
                 for id in &message_ids {
                     q = q.bind(id);
@@ -184,17 +194,12 @@ impl SqliteMailStore {
         Ok(())
     }
 
-    pub async fn upsert_folders(
-        &self,
-        account_id: i64,
-        folders: &[Folder],
-    ) -> Result<Vec<Folder>> {
-        let existing = sqlx::query_as::<_, (i64, String)>(
-            "SELECT id, name FROM folders WHERE account_id = ?",
-        )
-        .bind(account_id)
-        .fetch_all(&self.pool)
-        .await?;
+    pub async fn upsert_folders(&self, account_id: i64, folders: &[Folder]) -> Result<Vec<Folder>> {
+        let existing =
+            sqlx::query_as::<_, (i64, String)>("SELECT id, name FROM folders WHERE account_id = ?")
+                .bind(account_id)
+                .fetch_all(&self.pool)
+                .await?;
 
         let mut by_name: HashMap<String, i64> = HashMap::new();
         for (id, name) in existing {
@@ -212,14 +217,13 @@ impl SqliteMailStore {
                     .await?;
                 *id
             } else {
-                let result = sqlx::query(
-                    "INSERT INTO folders (account_id, name, unread) VALUES (?, ?, ?)",
-                )
-                .bind(account_id)
-                .bind(&folder.name)
-                .bind(folder.unread as i64)
-                .execute(&self.pool)
-                .await?;
+                let result =
+                    sqlx::query("INSERT INTO folders (account_id, name, unread) VALUES (?, ?, ?)")
+                        .bind(account_id)
+                        .bind(&folder.name)
+                        .bind(folder.unread as i64)
+                        .execute(&self.pool)
+                        .await?;
                 result.last_insert_rowid()
             };
             kept_names.push(folder.name.clone());
@@ -237,7 +241,11 @@ impl SqliteMailStore {
                 .execute(&self.pool)
                 .await?;
         } else {
-            let placeholders = kept_names.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let placeholders = kept_names
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
             let query = format!(
                 "DELETE FROM folders WHERE account_id = ? AND name NOT IN ({})",
                 placeholders
@@ -258,12 +266,11 @@ impl SqliteMailStore {
         folder_id: i64,
         messages: &[MessageSummary],
     ) -> Result<()> {
-        let existing: Vec<(i64, Option<i64>)> = sqlx::query_as(
-            "SELECT id, imap_uid FROM messages WHERE folder_id = ?",
-        )
-        .bind(folder_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let existing: Vec<(i64, Option<i64>)> =
+            sqlx::query_as("SELECT id, imap_uid FROM messages WHERE folder_id = ?")
+                .bind(folder_id)
+                .fetch_all(&self.pool)
+                .await?;
 
         let incoming_uids: Vec<i64> = messages
             .iter()
@@ -295,10 +302,7 @@ impl SqliteMailStore {
                     }
                     q.execute(&self.pool).await?;
                 }
-                let query = format!(
-                    "DELETE FROM messages WHERE id IN ({})",
-                    placeholders
-                );
+                let query = format!("DELETE FROM messages WHERE id IN ({})", placeholders);
                 let mut q = sqlx::query(&query);
                 for id in &to_delete {
                     q = q.bind(id);
@@ -416,13 +420,12 @@ impl SqliteMailStore {
     }
 
     pub async fn folder_id_by_name(&self, account_id: i64, name: &str) -> Result<Option<i64>> {
-        let row = sqlx::query_as::<_, (i64,)>(
-            "SELECT id FROM folders WHERE account_id = ? AND name = ?",
-        )
-        .bind(account_id)
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_as::<_, (i64,)>("SELECT id FROM folders WHERE account_id = ? AND name = ?")
+                .bind(account_id)
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|r| r.0))
     }
 
@@ -436,11 +439,18 @@ impl SqliteMailStore {
         Ok(row.map(|r| r.0))
     }
 
-    pub async fn get_folder_sync_state(
-        &self,
-        folder_id: i64,
-    ) -> Result<Option<FolderSyncState>> {
-        let row = sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>)>(
+    pub async fn get_folder_sync_state(&self, folder_id: i64) -> Result<Option<FolderSyncState>> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                i64,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+            ),
+        >(
             "SELECT folder_id, uidvalidity, uidnext, last_seen_uid, last_sync_ts, oldest_ts
              FROM folder_sync_state WHERE folder_id = ?",
         )
@@ -457,10 +467,7 @@ impl SqliteMailStore {
         }))
     }
 
-    pub async fn upsert_folder_sync_state(
-        &self,
-        state: &FolderSyncState,
-    ) -> Result<()> {
+    pub async fn upsert_folder_sync_state(&self, state: &FolderSyncState) -> Result<()> {
         sqlx::query(
             "INSERT INTO folder_sync_state
              (folder_id, uidvalidity, uidnext, last_seen_uid, last_sync_ts, oldest_ts)
@@ -488,27 +495,36 @@ impl SqliteMailStore {
             .fetch_one(&self.pool)
             .await?;
         if count.0 == 0 {
-            sqlx::query(
-                "INSERT INTO accounts (id, name, address) VALUES (1, ?, ?)",
-            )
-            .bind("personal@example.com")
-            .bind("personal@example.com")
-            .execute(&self.pool)
-            .await?;
+            sqlx::query("INSERT INTO accounts (id, name, address) VALUES (1, ?, ?)")
+                .bind("personal@example.com")
+                .bind("personal@example.com")
+                .execute(&self.pool)
+                .await?;
         } else {
-            let demo = sqlx::query_as::<_, (String,)>(
-                "SELECT name FROM accounts WHERE id = 1",
-            )
-            .fetch_one(&self.pool)
-            .await?
-            .0 == "personal@example.com";
+            let demo = sqlx::query_as::<_, (String,)>("SELECT name FROM accounts WHERE id = 1")
+                .fetch_one(&self.pool)
+                .await?
+                .0
+                == "personal@example.com";
             if demo {
-                sqlx::query("DELETE FROM cache_tiles").execute(&self.pool).await?;
-                sqlx::query("DELETE FROM cache_html").execute(&self.pool).await?;
-                sqlx::query("DELETE FROM cache_text").execute(&self.pool).await?;
-                sqlx::query("DELETE FROM bodies").execute(&self.pool).await?;
-                sqlx::query("DELETE FROM messages").execute(&self.pool).await?;
-                sqlx::query("DELETE FROM folders").execute(&self.pool).await?;
+                sqlx::query("DELETE FROM cache_tiles")
+                    .execute(&self.pool)
+                    .await?;
+                sqlx::query("DELETE FROM cache_html")
+                    .execute(&self.pool)
+                    .await?;
+                sqlx::query("DELETE FROM cache_text")
+                    .execute(&self.pool)
+                    .await?;
+                sqlx::query("DELETE FROM bodies")
+                    .execute(&self.pool)
+                    .await?;
+                sqlx::query("DELETE FROM messages")
+                    .execute(&self.pool)
+                    .await?;
+                sqlx::query("DELETE FROM folders")
+                    .execute(&self.pool)
+                    .await?;
             }
         }
 
@@ -532,13 +548,69 @@ impl SqliteMailStore {
         }
 
         let messages = vec![
-            (1, 1, "2026-02-03 10:31", "Alex Chen", "Re: Proposal", 1, "Thanks - attached is the updated..."),
-            (2, 1, "2026-02-03 09:58", "GitHub", "Security alert", 1, "We detected a new sign-in..."),
-            (3, 1, "2026-02-03 09:12", "HR", "Benefits 2026", 0, "Open enrollment starts..."),
-            (4, 1, "2026-02-03 08:44", "Newsletter", "Weekly digest", 1, "Top stories this week..."),
-            (5, 1, "2026-02-02 17:22", "Billing", "Invoice #1931", 0, "Your invoice is ready..."),
-            (6, 1, "2026-02-02 14:03", "Sam", "Lunch?", 0, "Want to grab lunch..."),
-            (7, 3, "2026-02-03 11:11", "Me", "Draft: Proposal follow-up", 0, "Draft message..."),
+            (
+                1,
+                1,
+                "2026-02-03 10:31",
+                "Alex Chen",
+                "Re: Proposal",
+                1,
+                "Thanks - attached is the updated...",
+            ),
+            (
+                2,
+                1,
+                "2026-02-03 09:58",
+                "GitHub",
+                "Security alert",
+                1,
+                "We detected a new sign-in...",
+            ),
+            (
+                3,
+                1,
+                "2026-02-03 09:12",
+                "HR",
+                "Benefits 2026",
+                0,
+                "Open enrollment starts...",
+            ),
+            (
+                4,
+                1,
+                "2026-02-03 08:44",
+                "Newsletter",
+                "Weekly digest",
+                1,
+                "Top stories this week...",
+            ),
+            (
+                5,
+                1,
+                "2026-02-02 17:22",
+                "Billing",
+                "Invoice #1931",
+                0,
+                "Your invoice is ready...",
+            ),
+            (
+                6,
+                1,
+                "2026-02-02 14:03",
+                "Sam",
+                "Lunch?",
+                0,
+                "Want to grab lunch...",
+            ),
+            (
+                7,
+                3,
+                "2026-02-03 11:11",
+                "Me",
+                "Draft: Proposal follow-up",
+                0,
+                "Draft message...",
+            ),
         ];
 
         for (id, folder_id, date, from, subject, unread, preview) in messages {
@@ -563,11 +635,26 @@ impl SqliteMailStore {
         }
 
         let bodies = vec![
-            (1, "Thanks - this looks good overall.\n\nI've added comments to section 3 regarding timelines."),
-            (2, "We detected a new sign-in to your account. If this was you, no action is needed."),
-            (3, "Open enrollment starts next week. Please review the benefits guide."),
-            (4, "Here is your weekly digest. Top stories and updates inside."),
-            (5, "Your invoice is ready. Please remit payment by the due date."),
+            (
+                1,
+                "Thanks - this looks good overall.\n\nI've added comments to section 3 regarding timelines.",
+            ),
+            (
+                2,
+                "We detected a new sign-in to your account. If this was you, no action is needed.",
+            ),
+            (
+                3,
+                "Open enrollment starts next week. Please review the benefits guide.",
+            ),
+            (
+                4,
+                "Here is your weekly digest. Top stories and updates inside.",
+            ),
+            (
+                5,
+                "Your invoice is ready. Please remit payment by the due date.",
+            ),
             (6, "Want to grab lunch today? I am free around noon."),
             (7, "Draft message..."),
         ];
@@ -702,11 +789,10 @@ Draft message...\r\n",
     }
 
     pub async fn cache_tiles_total_bytes(&self) -> Result<i64> {
-        let row = sqlx::query_as::<_, (Option<i64>,)>(
-            "SELECT SUM(LENGTH(png_bytes)) FROM cache_tiles",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_as::<_, (Option<i64>,)>("SELECT SUM(LENGTH(png_bytes)) FROM cache_tiles")
+                .fetch_one(&self.pool)
+                .await?;
         Ok(row.0.unwrap_or(0))
     }
 
@@ -756,28 +842,30 @@ impl MailStore for SqliteMailStore {
         .fetch_all(&self.pool)
         .await?;
 
-        let messages = sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, String, i64, String)>(
-            "SELECT id, folder_id, imap_uid, date, from_addr, subject, unread, preview
+        let messages =
+            sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, String, i64, String)>(
+                "SELECT id, folder_id, imap_uid, date, from_addr, subject, unread, preview
              FROM messages WHERE account_id = ? ORDER BY COALESCE(date_ts, 0) DESC, id DESC",
-        )
-        .bind(account_id)
-        .fetch_all(&self.pool)
-        .await?;
+            )
+            .bind(account_id)
+            .fetch_all(&self.pool)
+            .await?;
 
         let message_ids: Vec<i64> = messages.iter().map(|row| row.0).collect();
         let mut message_details = HashMap::new();
 
         for message_id in message_ids {
-            if let Ok((subject, from, date, body)) = sqlx::query_as::<_, (String, String, String, String)>(
-                "SELECT m.subject, m.from_addr, m.date, c.text
+            if let Ok((subject, from, date, body)) =
+                sqlx::query_as::<_, (String, String, String, String)>(
+                    "SELECT m.subject, m.from_addr, m.date, c.text
                  FROM messages m
                  LEFT JOIN cache_text c ON c.message_id = m.id AND c.width_cols = ?
                  WHERE m.id = ?",
-            )
-            .bind(DEFAULT_TEXT_WIDTH)
-            .bind(message_id)
-            .fetch_one(&self.pool)
-            .await
+                )
+                .bind(DEFAULT_TEXT_WIDTH)
+                .bind(message_id)
+                .fetch_one(&self.pool)
+                .await
             {
                 message_details.insert(
                     message_id,
@@ -827,12 +915,11 @@ impl MailStore for SqliteMailStore {
     }
 
     async fn get_raw_body(&self, message_id: i64) -> Result<Option<Vec<u8>>> {
-        let row = sqlx::query_as::<_, (Vec<u8>,)>(
-            "SELECT raw_bytes FROM bodies WHERE message_id = ?",
-        )
-        .bind(message_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_as::<_, (Vec<u8>,)>("SELECT raw_bytes FROM bodies WHERE message_id = ?")
+                .bind(message_id)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|r| r.0))
     }
 

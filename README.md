@@ -20,10 +20,11 @@ cargo install --git https://github.com/peter-fm/ratmail.git --locked
 2. Create config:
 
 ```bash
-cp ratmail.toml.example ratmail.toml
+mkdir -p ~/.config/ratmail
+cp ratmail.toml.example ~/.config/ratmail/ratmail.toml
 ```
 
-3. Edit `ratmail.toml` with your account details (see Configuration below).
+3. Edit `~/.config/ratmail/ratmail.toml` with your account details (see Configuration below).
 
 4. Run:
 
@@ -51,11 +52,17 @@ cargo install --git https://github.com/peter-fm/ratmail.git --locked
 
 ## Configuration
 
-Copy `ratmail.toml.example` to `ratmail.toml` and fill in one or more accounts:
+Ratmail looks for `ratmail.toml` in the current directory first, then in
+`~/.config/ratmail/ratmail.toml` (or `$XDG_CONFIG_HOME/ratmail/ratmail.toml`).
+Relative `db_path` values are stored under `~/.local/state/ratmail`
+(or `$XDG_STATE_HOME/ratmail`).
+
+Copy `ratmail.toml.example` to `~/.config/ratmail/ratmail.toml` and fill in one or more accounts:
 
 ```toml
 [[accounts]]
 name = "Personal"
+# Relative paths are stored under ~/.local/state/ratmail
 db_path = "ratmail-personal.db"
 
 [accounts.imap]
@@ -125,7 +132,7 @@ The easiest way to use Gmail SMTP is with an **App Password** (requires 2‑Step
 
 1. Enable 2‑Step Verification on your Google account.
 2. Create an App Password for “Mail”.
-3. Copy `ratmail.toml.example` to `ratmail.toml` and fill it in (supports multiple accounts):
+3. Copy `ratmail.toml.example` to `~/.config/ratmail/ratmail.toml` and fill it in (supports multiple accounts):
 
 ```toml
 [[accounts]]

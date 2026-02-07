@@ -1,13 +1,13 @@
 //! HTML rendering to image tiles (skeleton).
 
 use anyhow::Result;
-use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use headless_chrome::{Browser, LaunchOptionsBuilder};
-use image::{imageops::crop_imm, DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgba};
+use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgba, imageops::crop_imm};
 use std::io::Cursor;
-use std::time::{Duration, Instant};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use ratmail_core::TileMeta;
 
@@ -42,7 +42,9 @@ pub fn detect_image_support() -> bool {
         return true;
     }
     let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
-    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
+    let term_program = std::env::var("TERM_PROGRAM")
+        .unwrap_or_default()
+        .to_lowercase();
     let kitty = std::env::var("KITTY_WINDOW_ID").is_ok();
     let ghostty = term_program.contains("ghostty") || term.contains("ghostty");
     let iterm = term_program.contains("iterm");
