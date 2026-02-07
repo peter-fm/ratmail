@@ -348,6 +348,7 @@ struct App {
     render_tile_height_px_side: i64,
     render_scale: f64,
     show_preview: bool,
+    folder_pane_width: u16,
     show_help: bool,
     link_index: usize,
     attach_index: usize,
@@ -472,6 +473,7 @@ impl App {
         imap_enabled: bool,
         initial_sync_days: i64,
         render_scale: f64,
+        folder_pane_width: u16,
     ) -> Self {
         let mut app = Self {
             mode: Mode::List,
@@ -518,6 +520,7 @@ impl App {
             render_tile_height_px_side,
             render_scale,
             show_preview: false,
+            folder_pane_width,
             show_help: false,
             link_index: 0,
             attach_index: 0,
@@ -3089,6 +3092,7 @@ fn main() -> Result<()> {
         });
     }
     let render_config = load_render_config();
+    let ui_config = load_ui_config();
     let allow_remote_images = render_config.allow_remote_images
         || std::env::var("RATMAIL_REMOTE_IMAGES")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -3415,6 +3419,7 @@ fn main() -> Result<()> {
             account.imap.is_some(),
             initial_sync_days,
             render_scale,
+            ui_config.folder_width_cols,
         );
         apps.push(app);
     }
@@ -3554,13 +3559,13 @@ fn render_main(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .direction(Direction::Horizontal)
         .constraints(if app.show_preview {
             vec![
-                Constraint::Length(15),
+                Constraint::Length(app.folder_pane_width),
                 Constraint::Percentage(40),
                 Constraint::Percentage(45),
             ]
         } else {
             vec![
-                Constraint::Length(15),
+                Constraint::Length(app.folder_pane_width),
                 Constraint::Percentage(85),
                 Constraint::Length(0),
             ]
@@ -3673,7 +3678,11 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     .header(header)
     .block(
         Block::default()
-            .borders(Borders::RIGHT)
+            .borders(if app.show_preview {
+                Borders::RIGHT
+            } else {
+                Borders::NONE
+            })
             .title("MESSAGE LIST"),
     )
     .column_spacing(1);
@@ -4929,6 +4938,10 @@ struct RenderConfig {
     tile_height_px_focus: i64,
 }
 
+struct UiConfig {
+    folder_width_cols: u16,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "ratmail", version, about = "Terminal email client")]
 struct Cli {
@@ -5227,6 +5240,40 @@ fn load_render_config() -> RenderConfig {
         render_scale,
         tile_height_px_side,
         tile_height_px_focus,
+    }
+}
+
+fn load_ui_config() -> UiConfig {
+    let content = match load_config_text() {
+        Some(content) => content,
+        None => {
+            return UiConfig {
+                folder_width_cols: 15,
+            };
+        }
+    };
+    let value: toml::Value = match toml::from_str(&content) {
+        Ok(value) => value,
+        Err(_) => {
+            return UiConfig {
+                folder_width_cols: 15,
+            };
+        }
+    };
+    let ui = match value.get("ui") {
+        Some(ui) => ui,
+        None => {
+            return UiConfig {
+                folder_width_cols: 15,
+            };
+        }
+    };
+    let folder_width_cols = match ui.get("folder_width_cols") {
+        Some(v) => v.as_integer().unwrap_or(15) as i64,
+        None => 15,
+    };
+    UiConfig {
+        folder_width_cols: folder_width_cols.clamp(8, 40) as u16,
     }
 }
 

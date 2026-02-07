@@ -87,6 +87,9 @@ width_px = 1000
 render_scale = 1.0
 tile_height_px_side = 5000
 tile_height_px_focus = 120
+
+[ui]
+folder_width_cols = 15
 ```
 
 Notes:
