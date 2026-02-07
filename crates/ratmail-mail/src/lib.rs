@@ -33,6 +33,15 @@ pub enum MailCommand {
         name: String,
         mode: SyncMode,
     },
+    MoveMessages {
+        folder_name: String,
+        target_folder: String,
+        uids: Vec<u32>,
+    },
+    DeleteMessages {
+        folder_name: String,
+        uids: Vec<u32>,
+    },
     SendMessage {
         to: String,
         cc: String,
@@ -221,6 +230,36 @@ impl MailEngine {
                             });
                         }
                         let _ = evt_tx.send(MailEvent::BodyFetched(message_id));
+                    }
+                    MailCommand::MoveMessages {
+                        folder_name,
+                        target_folder,
+                        uids,
+                    } => {
+                        if let Some(imap) = imap.clone() {
+                            let tx = evt_tx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(err) =
+                                    move_imap_messages(&imap, &folder_name, &target_folder, &uids)
+                                {
+                                    let _ = tx.send(MailEvent::ImapError {
+                                        reason: err.to_string(),
+                                    });
+                                }
+                            });
+                        }
+                    }
+                    MailCommand::DeleteMessages { folder_name, uids } => {
+                        if let Some(imap) = imap.clone() {
+                            let tx = evt_tx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(err) = delete_imap_messages(&imap, &folder_name, &uids) {
+                                    let _ = tx.send(MailEvent::ImapError {
+                                        reason: err.to_string(),
+                                    });
+                                }
+                            });
+                        }
                     }
                     MailCommand::SetFlag { message_id, seen } => {
                         let _ = evt_tx.send(MailEvent::FlagUpdated { message_id, seen });
@@ -622,6 +661,45 @@ fn fetch_imap_body(imap: &ImapConfig, folder: &str, uid: u32) -> Result<Vec<u8>>
         .ok_or_else(|| anyhow!("No body found for UID {}", uid))?;
     let _ = session.logout();
     Ok(body)
+}
+
+fn move_imap_messages(
+    imap: &ImapConfig,
+    folder: &str,
+    target_folder: &str,
+    uids: &[u32],
+) -> Result<()> {
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let mut session = imap_connect(imap)?;
+    session.select(folder)?;
+    let uid_set = uid_set(uids);
+    session.uid_copy(&uid_set, target_folder)?;
+    session.uid_store(&uid_set, "+FLAGS.SILENT (\\Deleted)")?;
+    session.expunge()?;
+    session.logout()?;
+    Ok(())
+}
+
+fn delete_imap_messages(imap: &ImapConfig, folder: &str, uids: &[u32]) -> Result<()> {
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let mut session = imap_connect(imap)?;
+    session.select(folder)?;
+    let uid_set = uid_set(uids);
+    session.uid_store(&uid_set, "+FLAGS.SILENT (\\Deleted)")?;
+    session.expunge()?;
+    session.logout()?;
+    Ok(())
+}
+
+fn uid_set(uids: &[u32]) -> String {
+    uids.iter()
+        .map(|uid| uid.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn header_value(raw: &[u8], name: &str) -> Option<String> {

@@ -194,6 +194,105 @@ impl SqliteMailStore {
         Ok(())
     }
 
+    pub async fn move_messages(&self, message_ids: &[i64], target_folder_id: i64) -> Result<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = placeholders(message_ids.len());
+
+        let select_query = format!(
+            "SELECT DISTINCT folder_id FROM messages WHERE id IN ({})",
+            placeholders
+        );
+        let mut select = sqlx::query_as::<_, (i64,)>(&select_query);
+        for id in message_ids {
+            select = select.bind(id);
+        }
+        let mut affected_folders: Vec<i64> = select
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        if !affected_folders.contains(&target_folder_id) {
+            affected_folders.push(target_folder_id);
+        }
+
+        let update_query = format!(
+            "UPDATE messages SET folder_id = ? WHERE id IN ({})",
+            placeholders
+        );
+        let mut update = sqlx::query(&update_query).bind(target_folder_id);
+        for id in message_ids {
+            update = update.bind(id);
+        }
+        update.execute(&self.pool).await?;
+
+        self.update_folder_unread_counts(&affected_folders).await?;
+        Ok(())
+    }
+
+    pub async fn delete_messages(&self, message_ids: &[i64]) -> Result<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = placeholders(message_ids.len());
+
+        let select_query = format!(
+            "SELECT DISTINCT folder_id FROM messages WHERE id IN ({})",
+            placeholders
+        );
+        let mut select = sqlx::query_as::<_, (i64,)>(&select_query);
+        for id in message_ids {
+            select = select.bind(id);
+        }
+        let affected_folders: Vec<i64> = select
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+
+        for table in ["bodies", "cache_text", "cache_html", "cache_tiles"] {
+            let query = format!(
+                "DELETE FROM {} WHERE message_id IN ({})",
+                table, placeholders
+            );
+            let mut q = sqlx::query(&query);
+            for id in message_ids {
+                q = q.bind(id);
+            }
+            q.execute(&self.pool).await?;
+        }
+
+        let delete_query = format!("DELETE FROM messages WHERE id IN ({})", placeholders);
+        let mut delete = sqlx::query(&delete_query);
+        for id in message_ids {
+            delete = delete.bind(id);
+        }
+        delete.execute(&self.pool).await?;
+
+        self.update_folder_unread_counts(&affected_folders).await?;
+        Ok(())
+    }
+
+    async fn update_folder_unread_counts(&self, folder_ids: &[i64]) -> Result<()> {
+        for folder_id in folder_ids {
+            let row = sqlx::query_as::<_, (i64,)>(
+                "SELECT COUNT(*) FROM messages WHERE folder_id = ? AND unread = 1",
+            )
+            .bind(folder_id)
+            .fetch_one(&self.pool)
+            .await?;
+            sqlx::query("UPDATE folders SET unread = ? WHERE id = ?")
+                .bind(row.0)
+                .bind(folder_id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn upsert_folders(&self, account_id: i64, folders: &[Folder]) -> Result<Vec<Folder>> {
         let existing =
             sqlx::query_as::<_, (i64, String)>("SELECT id, name FROM folders WHERE account_id = ?")
@@ -823,6 +922,13 @@ Draft message...\r\n",
         }
         Ok(())
     }
+}
+
+fn placeholders(count: usize) -> String {
+    std::iter::repeat("?")
+        .take(count)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[async_trait]

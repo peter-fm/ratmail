@@ -197,6 +197,17 @@ enum StoreUpdate {
         raw: Vec<u8>,
         cached_text: Option<String>,
     },
+    MoveMessages {
+        account_id: i64,
+        message_ids: Vec<i64>,
+        target_folder_id: i64,
+        refresh_folder_id: i64,
+    },
+    DeleteMessages {
+        account_id: i64,
+        message_ids: Vec<i64>,
+        refresh_folder_id: i64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +234,9 @@ enum Mode {
     Compose,
     OverlayLinks,
     OverlayAttach,
+    OverlayBulkAction,
+    OverlayBulkMove,
+    OverlayConfirmDelete,
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +345,12 @@ struct App {
     link_index: usize,
     attach_index: usize,
     status_message: Option<String>,
+    selected_message_ids: HashSet<i64>,
+    bulk_action_ids: Vec<i64>,
+    bulk_folder_index: usize,
+    bulk_done_return: Mode,
+    confirm_delete_ids: Vec<i64>,
+    confirm_delete_return: Mode,
     picker_mode: Option<PickerMode>,
     picker_focus: PickerFocus,
     picker: Option<FileExplorer>,
@@ -492,6 +512,12 @@ impl App {
             link_index: 0,
             attach_index: 0,
             status_message: None,
+            selected_message_ids: HashSet::new(),
+            bulk_action_ids: Vec::new(),
+            bulk_folder_index: 0,
+            bulk_done_return: Mode::View,
+            confirm_delete_ids: Vec::new(),
+            confirm_delete_return: Mode::View,
             picker_mode: None,
             picker_focus: PickerFocus::Explorer,
             picker: None,
@@ -570,6 +596,190 @@ impl App {
             .collect();
         // Preserve backend ordering (already sorted by date).
         messages
+    }
+
+    fn prune_selected_messages(&mut self) {
+        if self.selected_message_ids.is_empty() {
+            return;
+        }
+        let visible: HashSet<i64> = self.visible_messages().iter().map(|m| m.id).collect();
+        self.selected_message_ids.retain(|id| visible.contains(id));
+        if self.selected_message_ids.is_empty() {
+            self.status_message = None;
+        }
+    }
+
+    fn clear_selected_messages(&mut self) {
+        self.selected_message_ids.clear();
+        self.bulk_action_ids.clear();
+        self.confirm_delete_ids.clear();
+        self.status_message = None;
+    }
+
+    fn toggle_select_current(&mut self) {
+        let message_id = match self.selected_message() {
+            Some(message) => message.id,
+            None => return,
+        };
+        if self.selected_message_ids.contains(&message_id) {
+            self.selected_message_ids.remove(&message_id);
+        } else {
+            self.selected_message_ids.insert(message_id);
+        }
+        let count = self.selected_message_ids.len();
+        if count > 0 {
+            self.status_message = Some(format!(
+                "Selected {} message{}",
+                count,
+                if count == 1 { "" } else { "s" }
+            ));
+        } else {
+            self.status_message = None;
+        }
+    }
+
+    fn active_message_ids(&self) -> Vec<i64> {
+        if !self.selected_message_ids.is_empty() {
+            return self.selected_message_ids.iter().copied().collect();
+        }
+        self.selected_message()
+            .map(|m| vec![m.id])
+            .unwrap_or_default()
+    }
+
+    fn default_move_folder_index(&self) -> usize {
+        let current_id = self.selected_folder().map(|f| f.id);
+        self.store
+            .folders
+            .iter()
+            .position(|f| Some(f.id) != current_id)
+            .unwrap_or(self.folder_index)
+    }
+
+    fn open_bulk_action_overlay(&mut self, ids: Vec<i64>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.bulk_action_ids = ids;
+        self.bulk_done_return = self.mode;
+        self.overlay_return = self.mode;
+        self.mode = Mode::OverlayBulkAction;
+    }
+
+    fn open_move_overlay(&mut self, ids: Vec<i64>, return_mode: Mode) {
+        if ids.is_empty() || self.store.folders.is_empty() {
+            return;
+        }
+        self.bulk_action_ids = ids;
+        self.bulk_folder_index = self.default_move_folder_index();
+        if return_mode != Mode::OverlayBulkAction {
+            self.bulk_done_return = return_mode;
+        }
+        self.overlay_return = return_mode;
+        self.mode = Mode::OverlayBulkMove;
+    }
+
+    fn open_confirm_delete(&mut self, ids: Vec<i64>, return_mode: Mode) {
+        if ids.is_empty() {
+            return;
+        }
+        self.confirm_delete_ids = ids;
+        self.confirm_delete_return = return_mode;
+        self.overlay_return = return_mode;
+        self.mode = Mode::OverlayConfirmDelete;
+    }
+
+    fn collect_imap_uids(&self, ids: &[i64]) -> Vec<u32> {
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(uid) = self
+                .store
+                .messages
+                .iter()
+                .find(|m| m.id == *id)
+                .and_then(|m| m.imap_uid)
+                .and_then(|uid| u32::try_from(uid).ok())
+            {
+                out.push(uid);
+            }
+        }
+        out
+    }
+
+    fn queue_move_messages(&mut self, ids: Vec<i64>, target_folder_id: i64) {
+        if ids.is_empty() {
+            return;
+        }
+        if Some(target_folder_id) == self.selected_folder().map(|f| f.id) {
+            self.status_message = Some("Already in that folder".to_string());
+            return;
+        }
+        let account_id = self.store.account.id;
+        let refresh_folder_id = self.selected_folder().map(|f| f.id).unwrap_or(1);
+        let _ = self.store_update_tx.send(StoreUpdate::MoveMessages {
+            account_id,
+            message_ids: ids.clone(),
+            target_folder_id,
+            refresh_folder_id,
+        });
+
+        if self.imap_enabled {
+            let uids = self.collect_imap_uids(&ids);
+            if !uids.is_empty() {
+                if let (Some(src_folder), Some(dst_folder)) = (
+                    self.selected_folder().map(|f| f.name.clone()),
+                    self.store
+                        .folders
+                        .iter()
+                        .find(|f| f.id == target_folder_id)
+                        .map(|f| f.name.clone()),
+                ) {
+                    let _ = self.engine.send(MailCommand::MoveMessages {
+                        folder_name: src_folder,
+                        target_folder: dst_folder,
+                        uids,
+                    });
+                }
+            }
+        }
+
+        self.clear_selected_messages();
+        self.status_message = Some(format!(
+            "Moved {} message{}",
+            ids.len(),
+            if ids.len() == 1 { "" } else { "s" }
+        ));
+    }
+
+    fn queue_delete_messages(&mut self, ids: Vec<i64>) {
+        if ids.is_empty() {
+            return;
+        }
+        let account_id = self.store.account.id;
+        let refresh_folder_id = self.selected_folder().map(|f| f.id).unwrap_or(1);
+        let _ = self.store_update_tx.send(StoreUpdate::DeleteMessages {
+            account_id,
+            message_ids: ids.clone(),
+            refresh_folder_id,
+        });
+
+        if self.imap_enabled {
+            let uids = self.collect_imap_uids(&ids);
+            if !uids.is_empty() {
+                if let Some(folder_name) = self.selected_folder().map(|f| f.name.clone()) {
+                    let _ = self
+                        .engine
+                        .send(MailCommand::DeleteMessages { folder_name, uids });
+                }
+            }
+        }
+
+        self.clear_selected_messages();
+        self.status_message = Some(format!(
+            "Deleted {} message{}",
+            ids.len(),
+            if ids.len() == 1 { "" } else { "s" }
+        ));
     }
 
     fn sort_folders(&mut self) {
@@ -720,7 +930,11 @@ impl App {
             Mode::List | Mode::View => self.on_key_main(key),
             Mode::ViewFocus => self.on_key_focus(key),
             Mode::Compose => self.on_key_compose(key),
-            Mode::OverlayLinks | Mode::OverlayAttach => self.on_key_overlay(key),
+            Mode::OverlayLinks
+            | Mode::OverlayAttach
+            | Mode::OverlayBulkAction
+            | Mode::OverlayBulkMove
+            | Mode::OverlayConfirmDelete => self.on_key_overlay(key),
         }
     }
 
@@ -734,6 +948,7 @@ impl App {
             self.store = snapshot;
             self.sort_folders();
             self.restore_selection(prev_folder, prev_uid);
+            self.prune_selected_messages();
             if self.store.folders.is_empty() {
                 self.select_inbox_if_available();
             }
@@ -1413,6 +1628,7 @@ impl App {
                     if self.folder_index + 1 < self.store.folders.len() {
                         self.folder_index += 1;
                         self.message_index = 0;
+                        self.clear_selected_messages();
                         self.request_sync_selected_folder();
                         if self.view_mode == ViewMode::Rendered {
                             self.schedule_render();
@@ -1436,6 +1652,7 @@ impl App {
                     if self.folder_index > 0 {
                         self.folder_index -= 1;
                         self.message_index = 0;
+                        self.clear_selected_messages();
                         self.request_sync_selected_folder();
                         if self.view_mode == ViewMode::Rendered {
                             self.schedule_render();
@@ -1443,25 +1660,50 @@ impl App {
                     }
                 }
             },
+            (KeyCode::Char(' '), _) => {
+                if self.focus == Focus::Messages {
+                    self.toggle_select_current();
+                    let count = self.visible_messages().len();
+                    if self.message_index + 1 < count {
+                        self.message_index += 1;
+                        if self.view_mode == ViewMode::Rendered {
+                            self.schedule_render();
+                            self.ensure_text_cache_for_selected();
+                        } else {
+                            self.ensure_text_cache_for_selected();
+                        }
+                        if self.message_index + 1 == count {
+                            self.request_backfill_selected_folder();
+                        }
+                    }
+                }
+            }
             (KeyCode::Enter, _) => {
                 if self.focus == Focus::Messages {
-                    self.mode = Mode::ViewFocus;
-                    self.view_scroll = 0;
-                    self.render_tile_height_px = self.render_tile_height_px_focus;
-                    self.render_tiles.clear();
-                    self.render_tile_count = 0;
-                    self.render_tiles_height_px = 0;
-                    self.render_message_id = None;
-                    self.image_protocol = None;
-                    self.ensure_text_cache_for_selected();
-                    if self.view_mode == ViewMode::Rendered {
-                        self.schedule_render();
+                    if !self.selected_message_ids.is_empty() {
+                        let ids = self.selected_message_ids.iter().copied().collect();
+                        self.open_bulk_action_overlay(ids);
+                    } else {
+                        self.mode = Mode::ViewFocus;
+                        self.view_scroll = 0;
+                        self.render_tile_height_px = self.render_tile_height_px_focus;
+                        self.render_tiles.clear();
+                        self.render_tile_count = 0;
+                        self.render_tiles_height_px = 0;
+                        self.render_message_id = None;
+                        self.image_protocol = None;
                         self.ensure_text_cache_for_selected();
+                        if self.view_mode == ViewMode::Rendered {
+                            self.schedule_render();
+                            self.ensure_text_cache_for_selected();
+                        }
                     }
                 }
             }
             (KeyCode::Esc, _) => {
-                if self.mode == Mode::ViewFocus {
+                if !self.selected_message_ids.is_empty() {
+                    self.clear_selected_messages();
+                } else if self.mode == Mode::ViewFocus {
                     self.mode = Mode::View;
                     self.render_tile_height_px = self.render_tile_height_px_side;
                     if self.view_mode == ViewMode::Rendered {
@@ -1528,6 +1770,18 @@ impl App {
             }
             (KeyCode::Char('c'), _) => {
                 self.start_compose_new();
+            }
+            (KeyCode::Char('m'), _) => {
+                if self.focus == Focus::Messages {
+                    let ids = self.active_message_ids();
+                    self.open_move_overlay(ids, self.mode);
+                }
+            }
+            (KeyCode::Char('d'), _) => {
+                if self.focus == Focus::Messages {
+                    let ids = self.active_message_ids();
+                    self.open_confirm_delete(ids, self.mode);
+                }
             }
             (KeyCode::Char('p'), _) => {
                 self.show_preview = !self.show_preview;
@@ -1701,6 +1955,64 @@ impl App {
                 }
                 KeyCode::Char('s') => {
                     self.prompt_save_selected_attachment();
+                }
+                _ => {}
+            },
+            Mode::OverlayBulkAction => match key.code {
+                KeyCode::Esc => {
+                    self.mode = self.overlay_return;
+                }
+                KeyCode::Char('q') => return true,
+                KeyCode::Char('m') => {
+                    let ids = self.bulk_action_ids.clone();
+                    self.open_move_overlay(ids, Mode::OverlayBulkAction);
+                }
+                KeyCode::Char('d') => {
+                    let ids = self.bulk_action_ids.clone();
+                    self.open_confirm_delete(ids, Mode::OverlayBulkAction);
+                }
+                _ => {}
+            },
+            Mode::OverlayBulkMove => match key.code {
+                KeyCode::Esc => {
+                    self.mode = self.overlay_return;
+                }
+                KeyCode::Char('q') => return true,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if self.bulk_folder_index + 1 < self.store.folders.len() {
+                        self.bulk_folder_index += 1;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if self.bulk_folder_index > 0 {
+                        self.bulk_folder_index -= 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(folder) = self.store.folders.get(self.bulk_folder_index) {
+                        let ids = self.bulk_action_ids.clone();
+                        self.queue_move_messages(ids, folder.id);
+                        if self.overlay_return == Mode::OverlayBulkAction {
+                            self.mode = self.bulk_done_return;
+                        } else {
+                            self.mode = self.overlay_return;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Mode::OverlayConfirmDelete => match key.code {
+                KeyCode::Esc => {
+                    self.mode = self.overlay_return;
+                }
+                KeyCode::Char('q') => return true,
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let ids = self.confirm_delete_ids.clone();
+                    self.queue_delete_messages(ids);
+                    self.mode = self.confirm_delete_return;
+                }
+                KeyCode::Char('n') => {
+                    self.mode = self.overlay_return;
                 }
                 _ => {}
             },
@@ -2894,6 +3206,29 @@ fn main() -> Result<()> {
                                     };
                                     store_for_task.load_snapshot(account_id, folder_id).await
                                 }
+                                StoreUpdate::MoveMessages {
+                                    account_id,
+                                    message_ids,
+                                    target_folder_id,
+                                    refresh_folder_id,
+                                } => {
+                                    store_for_task
+                                        .move_messages(&message_ids, target_folder_id)
+                                        .await?;
+                                    store_for_task
+                                        .load_snapshot(account_id, refresh_folder_id)
+                                        .await
+                                }
+                                StoreUpdate::DeleteMessages {
+                                    account_id,
+                                    message_ids,
+                                    refresh_folder_id,
+                                } => {
+                                    store_for_task.delete_messages(&message_ids).await?;
+                                    store_for_task
+                                        .load_snapshot(account_id, refresh_folder_id)
+                                        .await
+                                }
                             }
                         })(
                         )
@@ -3046,6 +3381,9 @@ fn ui(frame: &mut ratatui::Frame, multi: &mut MultiApp) {
     match app.mode {
         Mode::OverlayLinks => render_links_overlay(frame, area, app),
         Mode::OverlayAttach => render_attach_overlay(frame, area, app),
+        Mode::OverlayBulkAction => render_bulk_action_overlay(frame, area, app),
+        Mode::OverlayBulkMove => render_bulk_move_overlay(frame, area, app),
+        Mode::OverlayConfirmDelete => render_confirm_delete_overlay(frame, area, app),
         Mode::Compose => render_compose_overlay(frame, area, app),
         Mode::ViewFocus => render_view_focus(frame, area, app),
         _ => {}
@@ -3165,7 +3503,7 @@ fn render_folders(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let header = Row::new(vec![" ", "Time", "From", "Subject"]).style(
+    let header = Row::new(vec!["S", "Time", "From", "Subject"]).style(
         Style::default()
             .fg(Color::Gray)
             .add_modifier(Modifier::BOLD),
@@ -3186,7 +3524,10 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(idx, message)| {
             let global_idx = start + idx;
+            let selected = app.selected_message_ids.contains(&message.id);
+            let sel = if selected { "x" } else { " " };
             let unread = if message.unread { "*" } else { " " };
+            let marker = format!("{}{}", sel, unread);
             let style = if global_idx == app.message_index {
                 if app.focus == Focus::Messages {
                     Style::default().bg(Color::DarkGray)
@@ -3198,7 +3539,7 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             };
             let from_display = format_from_display(&message.from);
             Row::new(vec![
-                unread.to_string(),
+                marker,
                 message.date.clone(),
                 from_display,
                 message.subject.clone(),
@@ -3593,12 +3934,12 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
 fn render_help_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let mut help = if app.show_help {
         String::from(
-            "Tab/h/l focus  j/k move  Enter open  v toggle view  p preview  o older  [ ] switch acct  ? help\n\
-Ctrl+S/F5 send  r reply  R reply-all  f forward  d delete  q quit",
+            "Tab/h/l focus  j/k move  Space select+next  Enter open/actions  v toggle view  p preview  o older  [ ] switch acct  ? help  Esc clear\n\
+Ctrl+S/F5 send  r reply  R reply-all  f forward  m move  d delete  q quit",
         )
     } else {
         String::from(
-            "Tab/h/l focus  j/k move  Enter open  v view  p preview  o older  [ ] acct  ? help  q quit",
+            "Tab/h/l focus  j/k move  Space select+next  Enter open/actions  v view  p preview  o older  [ ] acct  ? help  Esc clear  q quit",
         )
     };
     if let Some(msg) = &app.status_message {
@@ -3707,6 +4048,80 @@ fn render_attach_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) 
     lines.push(Line::from("j/k move  Enter open  s save  Esc close"));
 
     let block = Block::default().borders(Borders::ALL).title("ATTACHMENTS");
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_bulk_action_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let popup = centered_rect(50, 40, area);
+    frame.render_widget(Clear, popup);
+
+    let count = app.bulk_action_ids.len();
+    let mut lines = Vec::new();
+    lines.push(Line::from(format!(
+        "Selected {} message{}",
+        count,
+        if count == 1 { "" } else { "s" }
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from("m move"));
+    lines.push(Line::from("d delete"));
+    lines.push(Line::from("Esc close"));
+
+    let block = Block::default().borders(Borders::ALL).title("BULK");
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_bulk_move_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let popup = centered_rect(70, 70, area);
+    frame.render_widget(Clear, popup);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from("Select folder to move to:"));
+    lines.push(Line::from(""));
+
+    for (idx, folder) in app.store.folders.iter().enumerate() {
+        let style = if idx == app.bulk_folder_index {
+            Style::default().bg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        let label = App::display_folder_name(&folder.name);
+        lines.push(Line::from(Span::styled(format!("  {}", label), style)));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Enter move  Esc back"));
+
+    let block = Block::default().borders(Borders::ALL).title("MOVE");
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_confirm_delete_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let popup = centered_rect(50, 30, area);
+    frame.render_widget(Clear, popup);
+
+    let count = app.confirm_delete_ids.len();
+    let mut lines = Vec::new();
+    lines.push(Line::from(format!(
+        "Delete {} message{}?",
+        count,
+        if count == 1 { "" } else { "s" }
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from("y confirm"));
+    lines.push(Line::from("n cancel"));
+    lines.push(Line::from("Esc close"));
+
+    let block = Block::default().borders(Borders::ALL).title("CONFIRM");
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
         .wrap(Wrap { trim: false });
