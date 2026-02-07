@@ -3046,6 +3046,7 @@ dependencies = [
  "anyhow",
  "crossterm 0.28.1",
  "image",
+ "linkify",
  "mailparse",
  "mime_guess",
  "open",

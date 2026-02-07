@@ -39,6 +39,7 @@ pub fn extract_display(raw: &[u8], width_cols: usize) -> Result<DisplayText> {
         (body, None)
     };
 
+    let text = normalize_display_text(&text);
     let links = extract_links(&text, html_for_links.as_deref());
 
     Ok(DisplayText { text, links })
@@ -344,4 +345,64 @@ fn extract_href_links(html: &str) -> Vec<String> {
     }
 
     out
+}
+
+fn normalize_display_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(ch);
+        }
+    }
+
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut prev_blank = false;
+    for line in normalized.split('\n') {
+        let trimmed = line.trim();
+        if is_horizontal_rule(trimmed) {
+            continue;
+        }
+        let is_blank = trimmed.is_empty();
+        if is_blank {
+            if prev_blank {
+                continue;
+            }
+            prev_blank = true;
+            out_lines.push(String::new());
+        } else {
+            prev_blank = false;
+            out_lines.push(line.to_string());
+        }
+    }
+
+    out_lines.join("\n")
+}
+
+fn is_horizontal_rule(trimmed: &str) -> bool {
+    let mut seen: Option<char> = None;
+    let mut count = 0usize;
+    for ch in trimmed.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if !is_rule_char(ch) {
+            return false;
+        }
+        count += 1;
+        seen = Some(seen.unwrap_or(ch));
+    }
+    count >= 3 && seen.is_some()
+}
+
+fn is_rule_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '-' | '_' | '=' | '*' | '~' | '—' | '–' | '─' | '━' | '·' | '•'
+    )
 }

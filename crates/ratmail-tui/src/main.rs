@@ -10,6 +10,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use linkify::{LinkFinder, LinkKind};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -78,6 +79,83 @@ fn log_debug(msg: &str) {
             let _ = writeln!(file, "[{}] {}", ts, msg);
         }
     }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = bytes[i + 1];
+                let lo = bytes[i + 2];
+                if let (Some(hi), Some(lo)) = (from_hex(hi), from_hex(lo)) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_mailto(link: &str) -> Option<(String, Option<String>, Option<String>)> {
+    if !link.to_lowercase().starts_with("mailto:") {
+        return None;
+    }
+    let rest = &link["mailto:".len()..];
+    let (addr_raw, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let addr = percent_decode(addr_raw).trim().to_string();
+    if addr.is_empty() {
+        return None;
+    }
+    let mut subject = None;
+    let mut body = None;
+    if !query.is_empty() {
+        for part in query.split('&') {
+            let (key, val) = part.split_once('=').unwrap_or((part, ""));
+            match key.to_ascii_lowercase().as_str() {
+                "subject" => subject = Some(percent_decode(val)),
+                "body" => body = Some(percent_decode(val)),
+                _ => {}
+            }
+        }
+    }
+    Some((addr, subject, body))
+}
+
+fn looks_like_email(link: &str) -> bool {
+    let trimmed = link.trim();
+    if trimmed.is_empty() || trimmed.contains(' ') || trimmed.contains("://") {
+        return false;
+    }
+    let mut parts = trimmed.split('@');
+    let (Some(local), Some(domain)) = (parts.next(), parts.next()) else { return false };
+    if parts.next().is_some() {
+        return false;
+    }
+    !local.is_empty() && domain.contains('.')
 }
 
 #[derive(Debug, Clone)]
@@ -667,6 +745,27 @@ impl App {
         self.compose_cursor_body = 0;
         self.compose_body_desired_col = None;
         self.mode = Mode::Compose;
+    }
+
+    fn start_compose_to(&mut self, to: String, subject: Option<String>, body: Option<String>) {
+        self.start_compose_new();
+        self.compose_to = to;
+        if let Some(subject) = subject {
+            self.compose_subject = subject;
+        }
+        if let Some(body) = body {
+            self.compose_body = body;
+        }
+        self.compose_cursor_to = text_char_len(&self.compose_to);
+        self.compose_cursor_subject = text_char_len(&self.compose_subject);
+        self.compose_cursor_body = text_char_len(&self.compose_body);
+        self.compose_focus = if !self.compose_body.is_empty() {
+            ComposeFocus::Body
+        } else if !self.compose_subject.is_empty() {
+            ComposeFocus::Subject
+        } else {
+            ComposeFocus::To
+        };
     }
 
     fn start_compose_reply(&mut self, reply_all: bool) {
@@ -1502,7 +1601,13 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(detail) = self.selected_detail() {
                         if let Some(link) = detail.links.get(self.link_index) {
-                            let _ = open::that(link);
+                            if let Some((to, subject, body)) = parse_mailto(link) {
+                                self.start_compose_to(to, subject, body);
+                            } else if looks_like_email(link) {
+                                self.start_compose_to(link.to_string(), None, None);
+                            } else {
+                                let _ = open::that(link);
+                            }
                         }
                     }
                 }
@@ -3083,6 +3188,105 @@ fn scale_image(img: image::DynamicImage, scale: f64) -> image::DynamicImage {
     ))
 }
 
+fn link_style() -> Style {
+    Style::default()
+        .fg(Color::LightBlue)
+        .add_modifier(Modifier::UNDERLINED)
+}
+
+fn find_reference_links(line: &str) -> Vec<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'[' {
+            i += 1;
+            continue;
+        }
+        let text_end = match bytes[i + 1..].iter().position(|&b| b == b']') {
+            Some(pos) => i + 1 + pos,
+            None => break,
+        };
+        let idx_start = text_end + 1;
+        if idx_start + 1 >= bytes.len() || bytes[idx_start] != b'[' {
+            i += 1;
+            continue;
+        }
+        let idx_end = match bytes[idx_start + 1..].iter().position(|&b| b == b']') {
+            Some(pos) => idx_start + 1 + pos,
+            None => break,
+        };
+        if idx_end <= idx_start + 1 {
+            i += 1;
+            continue;
+        }
+        if bytes[idx_start + 1..idx_end]
+            .iter()
+            .all(|b| b.is_ascii_digit())
+        {
+            out.push((i, idx_end + 1));
+            i = idx_end + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn build_spans_with_ranges(line: &str, mut ranges: Vec<(usize, usize)>) -> Vec<Span<'_>> {
+    if ranges.is_empty() {
+        return vec![Span::raw(line)];
+    }
+    ranges.sort_by_key(|(start, _)| *start);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some((last_start, last_end)) = merged.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                *last_start = (*last_start).min(start);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    let mut spans = Vec::new();
+    let mut last = 0usize;
+    for (start, end) in merged {
+        if start > last {
+            spans.push(Span::raw(&line[last..start]));
+        }
+        spans.push(Span::styled(&line[start..end], link_style()));
+        last = end;
+    }
+    if last < line.len() {
+        spans.push(Span::raw(&line[last..]));
+    }
+    spans
+}
+
+fn text_with_link_style(text: &str) -> Text<'_> {
+    let mut lines = Vec::new();
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url, LinkKind::Email]);
+
+    for line in text.split('\n') {
+        let mut ranges: Vec<(usize, usize)> = finder
+            .links(line)
+            .map(|link| (link.start(), link.end()))
+            .collect();
+        ranges.extend(find_reference_links(line));
+        let spans = if line.is_empty() {
+            vec![Span::raw("")]
+        } else {
+            build_spans_with_ranges(line, ranges)
+        };
+        lines.push(Line::from(spans));
+    }
+
+    Text::from(lines)
+}
+
 fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, scroll: u16) {
     let detail = app.selected_detail().cloned();
     let view_mode = app.view_mode;
@@ -3129,7 +3333,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                         Line::from("Or RATMAIL_CHROME_NO_SANDBOX=1"),
                     ])
                 } else if render_no_html {
-                    Text::from(detail.body.as_str())
+                    text_with_link_style(detail.body.as_str())
                 } else if render_tile_count == 0 && renderer_is_chromium {
                     Text::from(vec![
                         Line::from(""),
@@ -3147,7 +3351,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                     ])
                 }
             }
-            ViewMode::Text => Text::from(detail.body.as_str()),
+            ViewMode::Text => text_with_link_style(detail.body.as_str()),
         };
 
         let content_block = Paragraph::new(content_text)
@@ -3320,9 +3524,9 @@ fn render_links_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         } else {
             for (idx, link) in detail.links.iter().enumerate() {
                 let style = if idx == app.link_index {
-                    Style::default().bg(Color::DarkGray)
+                    link_style().bg(Color::DarkGray)
                 } else {
-                    Style::default()
+                    link_style()
                 };
                 lines.push(Line::from(Span::styled(
                     format!("  {:>2}  {}", idx + 1, link),
