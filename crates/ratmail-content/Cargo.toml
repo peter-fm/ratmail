@@ -1,0 +1,17 @@
+[package]
+name = "ratmail-content"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ammonia.workspace = true
+base64.workspace = true
+html2text.workspace = true
+html-escape.workspace = true
+linkify.workspace = true
+mailparse.workspace = true
+serde.workspace = true
+
+ratmail-core = { path = "../ratmail-core" }

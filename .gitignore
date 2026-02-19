@@ -1,0 +1,4 @@
+/target
+*.db*
+ratmail.toml
+ratmail_OLD.toml_OLD

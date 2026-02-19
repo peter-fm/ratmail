@@ -1,0 +1,5 @@
+version: 1
+metadata:
+  display_name: Ratmail CLI
+  short_description: Run ratmail CLI commands and produce JSON output.
+  default_prompt: Operate the ratmail CLI safely, configure ratmail.toml, and provide jq-friendly JSON guidance.

@@ -1,0 +1,73 @@
+# Copy to ~/.config/ratmail/ratmail.toml (or $XDG_CONFIG_HOME/ratmail/ratmail.toml)
+# and fill in your SMTP credentials.
+# Keep this file private (do not commit).
+# Multi-account format:
+[[accounts]]
+name = "Personal"
+# Relative paths are stored under ~/.local/state/ratmail (or $XDG_STATE_HOME/ratmail)
+db_path = "ratmail-personal.db"
+
+[accounts.smtp]
+host = "smtp.example.com"
+port = 587
+username = "user@example.com"
+password = "app-password-or-smtp-password"
+from = "Your Name <user@example.com>"
+skip_tls_verify = false
+
+[accounts.imap]
+host = "imap.example.com"
+port = 993
+username = "user@example.com"
+password = "app-password-or-imap-password"
+skip_tls_verify = false
+initial_sync_days = 90
+fetch_chunk_size = 10
+
+# Add more accounts by repeating [[accounts]] blocks.
+
+[render]
+remote_images = true
+render_scale = 1.5
+tile_height_px_side = 1000
+tile_height_px_focus = 60
+
+[send]
+# Include a text/html alternative part for outgoing mail.
+html = true
+font_family = "Arial, sans-serif"
+font_size_px = 14
+
+[ui]
+folder_width_cols = 25
+theme = "default"
+# Presets: default, ratmail, nord, gruvbox, solarized-dark, solarized-light,
+# dracula, catppuccin-mocha, catppuccin-latte, custom
+# Enable vim-style modal editing in the compose body.
+# compose_vim = true
+
+# Custom palette (hex colors)
+# theme = "custom"
+#
+# [ui.palette]
+# base_fg = "#d8dee9"
+# base_bg = "#2e3440"
+# border = "#4c566a"
+# bar_fg = "#e5e9f0"
+# bar_bg = "#3b4252"
+# accent = "#88c0d0"
+# warn = "#ebcb8b"
+# error = "#bf616a"
+# selection_bg = "#434c5e"
+# selection_fg = "#88c0d0"
+# link = "#88c0d0"
+# muted = "#7a8499"
+
+[spell]
+lang = "en_US"
+# dir = "/path/to/hunspell"
+# ignore = ["alice", "bob", "ratmail"]
+
+[cli]
+enabled = true
+default_account = "Personal"
