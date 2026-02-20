@@ -12,6 +12,5 @@ html2text.workspace = true
 html-escape.workspace = true
 linkify.workspace = true
 mailparse.workspace = true
-serde.workspace = true
 
 ratmail-core = { path = "../ratmail-core" }

@@ -6,13 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
 serde.workspace = true
 tokio.workspace = true
 lettre.workspace = true
-mime.workspace = true
 imap.workspace = true
-native-tls.workspace = true
 imap-proto.workspace = true
 mailparse.workspace = true
 chrono.workspace = true
