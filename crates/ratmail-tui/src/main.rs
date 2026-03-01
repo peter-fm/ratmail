@@ -2291,9 +2291,8 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let visible = app.visible_messages();
     let total = visible.len();
     let rows_visible = area.height.saturating_sub(2).max(1) as usize;
-    let mut start = app
-        .message_index
-        .saturating_sub(rows_visible.saturating_sub(1));
+    // Keep selection near the middle of the viewport for smoother up/down scrolling.
+    let mut start = app.message_index.saturating_sub(rows_visible / 2);
     if start + rows_visible > total {
         start = total.saturating_sub(rows_visible);
     }
