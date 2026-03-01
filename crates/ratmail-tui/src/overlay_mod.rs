@@ -303,33 +303,44 @@ pub(crate) fn render_confirm_link_overlay(frame: &mut ratatui::Frame, area: Rect
     let popup = centered_rect(70, 40, area);
     frame.render_widget(Clear, popup);
 
-    let mut lines = Vec::new();
-    lines.push(Line::from("Open link?"));
-    lines.push(Line::from(""));
-    if let Some(link) = &app.confirm_link {
-        let display = link_display_label(link, None);
-        if display != link.url {
-            lines.push(Line::from(format!("Text: {}", display)));
-        }
-        lines.push(Line::from(format!("URL: {}", link.url)));
-    } else {
-        lines.push(Line::from("URL: (none)"));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from("y confirm"));
-    lines.push(Line::from("n cancel"));
-    lines.push(Line::from("Esc close"));
-
     let block = Block::default()
         .borders(Borders::ALL)
         .title("CONFIRM")
         .style(app.ui_theme.base)
         .border_style(app.ui_theme.border);
-    let paragraph = Paragraph::new(Text::from(lines))
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(inner);
+
+    let mut body_lines = Vec::new();
+    body_lines.push(Line::from("Open link?"));
+    body_lines.push(Line::from(""));
+    if let Some(link) = &app.confirm_link {
+        let display = link_display_label(link, None);
+        if display != link.url {
+            body_lines.push(Line::from(format!("Text: {}", display)));
+        }
+        body_lines.push(Line::from(format!("URL: {}", link.url)));
+    } else {
+        body_lines.push(Line::from("URL: (none)"));
+    }
+    let body = Paragraph::new(Text::from(body_lines))
         .style(app.ui_theme.base)
-        .block(block)
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, popup);
+    frame.render_widget(body, rows[0]);
+
+    let footer = Paragraph::new(Text::from(vec![
+        Line::from("y confirm"),
+        Line::from("n cancel"),
+        Line::from("Esc close"),
+    ]))
+    .style(app.ui_theme.base)
+    .wrap(Wrap { trim: false });
+    frame.render_widget(footer, rows[1]);
 }
 
 pub(crate) fn render_confirm_draft_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
