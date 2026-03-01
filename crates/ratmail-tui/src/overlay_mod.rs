@@ -448,14 +448,12 @@ pub(crate) fn render_picker_overlay(frame: &mut ratatui::Frame, area: Rect, app:
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    app.refresh_picker_preview();
-
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(4)])
         .split(inner);
 
-    if rows[0].width >= 60 {
+    if app.picker_preview_visible && rows[0].width >= 60 {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Ratio(3, 5), Constraint::Ratio(2, 5)])
@@ -485,7 +483,7 @@ pub(crate) fn render_picker_overlay(frame: &mut ratatui::Frame, area: Rect, app:
     match mode {
         PickerMode::Attach => {
             lines.push(Line::from(
-                "Enter attach  Right/L enter dir  Left/Back parent  Ctrl+H toggle hidden  Ctrl+U clear filter  Esc cancel",
+                "Enter attach  p preview  j/k scroll  Right/L enter dir  Left/Back parent  Ctrl+H toggle hidden  Ctrl+U clear filter  Esc cancel",
             ));
         }
         PickerMode::Save { ref filename, .. } => {
@@ -506,7 +504,7 @@ pub(crate) fn render_picker_overlay(frame: &mut ratatui::Frame, area: Rect, app:
             };
             lines.push(Line::from(format!("{} {}", label, display)));
             lines.push(Line::from(
-                "Tab focus  Enter save  Right/L enter dir  Left/Back parent  Ctrl+U clear filter  Esc cancel",
+                "Tab focus  p preview  Enter save  Right/L enter dir  Left/Back parent  Ctrl+U clear filter  Esc cancel",
             ));
         }
     }

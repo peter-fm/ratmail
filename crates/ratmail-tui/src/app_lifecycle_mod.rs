@@ -118,6 +118,7 @@ impl App {
             picker_filename: String::new(),
             picker_cursor: 0,
             picker_filter: String::new(),
+            picker_preview_visible: false,
             picker_preview_path: None,
             picker_preview_kind: PickerPreviewKind::Empty,
             picker_preview_text: String::new(),

@@ -53,7 +53,6 @@ impl App {
             self.picker_filename = filename.clone();
             self.picker_cursor = text_char_len(&self.picker_filename);
         }
-        self.refresh_picker_preview();
     }
 
     pub(crate) fn close_picker(&mut self, status: &str) {
@@ -90,7 +89,7 @@ impl App {
         };
         if input != ExplorerInput::None {
             let _ = picker.handle(input);
-            self.refresh_picker_preview();
+            self.reset_picker_preview();
         }
     }
 
@@ -102,7 +101,7 @@ impl App {
             if matches!(key.code, KeyCode::Char('u')) && !self.picker_filter.is_empty() {
                 self.picker_filter.clear();
                 picker.clear_filter();
-                self.refresh_picker_preview();
+                self.reset_picker_preview();
                 return true;
             }
             return false;
@@ -112,7 +111,7 @@ impl App {
                 if !self.picker_filter.is_empty() {
                     self.picker_filter.pop();
                     picker.set_filter(self.picker_filter.clone());
-                    self.refresh_picker_preview();
+                    self.reset_picker_preview();
                     return true;
                 }
             }
@@ -123,7 +122,7 @@ impl App {
                     }
                     self.picker_filter.push(c);
                     picker.set_filter(self.picker_filter.clone());
-                    self.refresh_picker_preview();
+                    self.reset_picker_preview();
                     return true;
                 }
             }
@@ -266,6 +265,7 @@ impl App {
     }
 
     pub(crate) fn reset_picker_preview(&mut self) {
+        self.picker_preview_visible = false;
         self.picker_preview_path = None;
         self.picker_preview_kind = PickerPreviewKind::Empty;
         self.picker_preview_text.clear();

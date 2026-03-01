@@ -572,6 +572,15 @@ impl App {
                 }
                 return false;
             }
+            KeyCode::Char('p') if self.picker_focus == PickerFocus::Explorer => {
+                if self.picker_preview_visible {
+                    self.reset_picker_preview();
+                } else {
+                    self.picker_preview_visible = true;
+                    self.refresh_picker_preview();
+                }
+                return false;
+            }
             _ => {}
         }
 

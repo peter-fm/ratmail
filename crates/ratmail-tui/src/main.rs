@@ -569,6 +569,7 @@ struct App {
     picker_filename: String,
     picker_cursor: usize,
     picker_filter: String,
+    picker_preview_visible: bool,
     picker_preview_path: Option<PathBuf>,
     picker_preview_kind: PickerPreviewKind,
     picker_preview_text: String,
