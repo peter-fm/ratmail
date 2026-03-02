@@ -6,7 +6,11 @@ pub(crate) fn allowed_fields(_config: &CliConfig) -> HashSet<String> {
     all_message_fields()
 }
 
-pub(crate) fn cli_allows_command(_config: &CliConfig, _command_id: &str, _is_mutation: bool) -> bool {
+pub(crate) fn cli_allows_command(
+    _config: &CliConfig,
+    _command_id: &str,
+    _is_mutation: bool,
+) -> bool {
     true
 }
 

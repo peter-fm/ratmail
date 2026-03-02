@@ -128,6 +128,7 @@ impl App {
             picker_preview_protocol: None,
             picker_pdf_preview_available: None,
             picker_preview_error: None,
+            image_resize_prompt: None,
             imap_enabled,
             last_folder_sync: None,
             last_backfill: None,

@@ -75,7 +75,8 @@ use crate::message_parse_mod::{
 use crate::overlay_mod::{
     render_attach_overlay, render_bulk_action_overlay, render_bulk_move_overlay,
     render_confirm_delete_overlay, render_confirm_draft_overlay, render_confirm_link_overlay,
-    render_links_overlay, render_picker_overlay, render_search_overlay, render_spellcheck_overlay,
+    render_image_resize_overlay, render_links_overlay, render_picker_overlay,
+    render_search_overlay, render_spellcheck_overlay,
 };
 use crate::render_mod::{RenderEvent, RenderRequest, render_worker};
 use crate::util_mod::{
@@ -341,6 +342,51 @@ enum PickerPreviewKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageResizePreset {
+    Full,
+    Large,
+    Medium,
+    Small,
+}
+
+impl ImageResizePreset {
+    fn ordered() -> [Self; 4] {
+        [Self::Full, Self::Large, Self::Medium, Self::Small]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "Full",
+            Self::Large => "Large",
+            Self::Medium => "Medium",
+            Self::Small => "Small",
+        }
+    }
+
+    fn max_dimension_px(self) -> Option<u32> {
+        match self {
+            Self::Full => None,
+            Self::Large => Some(2560),
+            Self::Medium => Some(1280),
+            Self::Small => Some(800),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImageResizeOption {
+    preset: ImageResizePreset,
+    size_label: String,
+}
+
+#[derive(Debug, Clone)]
+struct ImageResizePrompt {
+    path: PathBuf,
+    selected: ImageResizePreset,
+    options: Vec<ImageResizeOption>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Folders,
     Messages,
@@ -579,6 +625,7 @@ struct App {
     picker_preview_protocol: Option<StatefulProtocol>,
     picker_pdf_preview_available: Option<bool>,
     picker_preview_error: Option<String>,
+    image_resize_prompt: Option<ImageResizePrompt>,
     imap_enabled: bool,
     last_folder_sync: Option<(String, Instant)>,
     last_backfill: Option<(String, Instant)>,
@@ -2154,6 +2201,9 @@ fn ui(frame: &mut ratatui::Frame, multi: &mut MultiApp) {
 
     if app.picker_mode.is_some() {
         render_picker_overlay(frame, area, app);
+        if app.image_resize_prompt.is_some() {
+            render_image_resize_overlay(frame, area, app);
+        }
     }
 }
 

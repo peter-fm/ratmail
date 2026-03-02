@@ -7,8 +7,8 @@ use ratatui::{
 use ratatui_image::{Resize, StatefulImage};
 
 use super::{
-    App, PickerFocus, PickerMode, PickerPreviewKind, SpellTarget, centered_rect, format_size,
-    link_display_label, set_cursor_at, spell_issue_context_line, truncate_label,
+    App, ImageResizePreset, PickerFocus, PickerMode, PickerPreviewKind, SpellTarget, centered_rect,
+    format_size, link_display_label, set_cursor_at, spell_issue_context_line, truncate_label,
 };
 
 pub(crate) fn render_search_overlay(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
@@ -531,6 +531,74 @@ pub(crate) fn render_picker_overlay(frame: &mut ratatui::Frame, area: Rect, app:
         let y = rows[1].y + 2;
         frame.set_cursor_position((x, y));
     }
+}
+
+pub(crate) fn render_image_resize_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let Some(prompt) = app.image_resize_prompt.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(45, 40, area);
+    frame.render_widget(Clear, popup);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from("Choose image size for attachment:"));
+    lines.push(Line::from(""));
+
+    let options = if prompt.options.is_empty() {
+        ImageResizePreset::ordered()
+            .into_iter()
+            .map(|preset| (preset, "n/a".to_string()))
+            .collect::<Vec<_>>()
+    } else {
+        prompt
+            .options
+            .iter()
+            .map(|entry| (entry.preset, entry.size_label.clone()))
+            .collect::<Vec<_>>()
+    };
+    for (idx, (option, size_label)) in options.into_iter().enumerate() {
+        let marker = if prompt.selected == option { ">" } else { " " };
+        let detail = match option.max_dimension_px() {
+            None => "original",
+            Some(_) => {
+                if option == ImageResizePreset::Small {
+                    "up to 800px"
+                } else if option == ImageResizePreset::Medium {
+                    "up to 1280px"
+                } else {
+                    "up to 2560px"
+                }
+            }
+        };
+        lines.push(Line::from(format!(
+            "{} {}. {:<6} ({}, {})",
+            marker,
+            idx + 1,
+            option.label(),
+            detail,
+            size_label
+        )));
+    }
+
+    lines.push(Line::from(""));
+    let filename = prompt
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image");
+    lines.push(Line::from(format!("File: {}", filename)));
+    lines.push(Line::from("j/k or Up/Down move  Enter choose  Esc cancel"));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("IMAGE SIZE")
+        .style(app.ui_theme.base)
+        .border_style(app.ui_theme.border);
+    let paragraph = Paragraph::new(Text::from(lines))
+        .style(app.ui_theme.base)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
 }
 
 fn render_picker_preview(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {

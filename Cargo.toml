@@ -24,7 +24,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 imap = "3.0.0-alpha.15"
 imap-proto = "0.16"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 ratatui-image = { version = "10.0.4", default-features = false, features = ["crossterm", "image-defaults"] }
 headless_chrome = "1.0.17"
 open = "5.3"

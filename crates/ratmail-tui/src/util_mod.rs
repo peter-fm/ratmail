@@ -110,10 +110,13 @@ pub(crate) fn render_pdf_first_page(path: &Path) -> Result<DynamicImage> {
 }
 
 pub(crate) fn format_size(bytes: usize) -> String {
-    if bytes >= 1024 * 1024 {
-        format!("{} MB", (bytes as f64 / (1024.0 * 1024.0)).round() as usize)
-    } else if bytes >= 1024 {
-        format!("{} KB", (bytes as f64 / 1024.0).round() as usize)
+    let bytes_f = bytes as f64;
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes_f / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes_f / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.1} KB", bytes_f / 1_000.0)
     } else {
         format!("{} B", bytes)
     }

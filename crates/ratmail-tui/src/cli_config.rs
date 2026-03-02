@@ -1,6 +1,6 @@
 use super::{
-    CliConfig, RenderConfig, SendConfig, SpellConfig, UiConfig, load_config_text, normalize_ui_theme,
-    parse_ui_palette,
+    CliConfig, RenderConfig, SendConfig, SpellConfig, UiConfig, load_config_text,
+    normalize_ui_theme, parse_ui_palette,
 };
 
 pub(crate) fn load_render_config() -> RenderConfig {

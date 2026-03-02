@@ -4,13 +4,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratmail_mail::{MailCommand, OutgoingAttachment};
 
 use super::{
-    App, ComposeFocus, ComposeVimMode, InlineSpellSuggest, Mode, PickerFocus, PickerMode,
-    SpellTarget, VisualMove, add_spell_ignore_word, apply_compose_key, apply_input_key,
+    App, ComposeFocus, ComposeVimMode, ImageResizePreset, InlineSpellSuggest, Mode, PickerFocus,
+    PickerMode, SpellTarget, VisualMove, add_spell_ignore_word, apply_compose_key, apply_input_key,
     build_html_body, char_index_from_row_col, char_to_byte_idx, collect_spell_issues,
     compose_buffer_from_body, compose_focus_next, compose_focus_prev, compose_move_visual,
-    compose_token_at_cursor, cursor_from_char_index, move_cursor_left, move_cursor_right,
-    next_index, parse_from_addrs, prev_index, replace_range_chars, spell_dictionary, text_char_len,
-    word_at_col,
+    compose_token_at_cursor, cursor_from_char_index, format_size, move_cursor_left,
+    move_cursor_right, next_index, parse_from_addrs, prev_index, replace_range_chars,
+    spell_dictionary, text_char_len, word_at_col,
 };
 
 impl App {
@@ -558,6 +558,99 @@ impl App {
         let Some(mode) = self.picker_mode.clone() else {
             return false;
         };
+        if self.image_resize_prompt.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.image_resize_prompt = None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Some(prompt) = self.image_resize_prompt.as_mut() {
+                        let options = ImageResizePreset::ordered();
+                        let current = options
+                            .iter()
+                            .position(|opt| *opt == prompt.selected)
+                            .unwrap_or(0);
+                        let next = next_index(current, options.len());
+                        prompt.selected = options[next];
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(prompt) = self.image_resize_prompt.as_mut() {
+                        let options = ImageResizePreset::ordered();
+                        let current = options
+                            .iter()
+                            .position(|opt| *opt == prompt.selected)
+                            .unwrap_or(0);
+                        let prev = prev_index(current, options.len());
+                        prompt.selected = options[prev];
+                    }
+                }
+                KeyCode::Char('1') => {
+                    if let Some(prompt) = self.image_resize_prompt.as_mut() {
+                        prompt.selected = ImageResizePreset::Full;
+                    }
+                }
+                KeyCode::Char('2') => {
+                    if let Some(prompt) = self.image_resize_prompt.as_mut() {
+                        prompt.selected = ImageResizePreset::Large;
+                    }
+                }
+                KeyCode::Char('3') => {
+                    if let Some(prompt) = self.image_resize_prompt.as_mut() {
+                        prompt.selected = ImageResizePreset::Medium;
+                    }
+                }
+                KeyCode::Char('4') => {
+                    if let Some(prompt) = self.image_resize_prompt.as_mut() {
+                        prompt.selected = ImageResizePreset::Small;
+                    }
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    if let Some(prompt) = self.image_resize_prompt.as_mut() {
+                        prompt.selected = ImageResizePreset::Full;
+                    }
+                }
+                KeyCode::Char('l') | KeyCode::Char('L') => {
+                    if let Some(prompt) = self.image_resize_prompt.as_mut() {
+                        prompt.selected = ImageResizePreset::Large;
+                    }
+                }
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    if let Some(prompt) = self.image_resize_prompt.as_mut() {
+                        prompt.selected = ImageResizePreset::Medium;
+                    }
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    if let Some(prompt) = self.image_resize_prompt.as_mut() {
+                        prompt.selected = ImageResizePreset::Small;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(prompt) = self.image_resize_prompt.clone() {
+                        match self.add_compose_attachment_from_path_with_preset(
+                            &prompt.path,
+                            prompt.selected,
+                        ) {
+                            Ok(added) => {
+                                self.image_resize_prompt = None;
+                                self.close_picker(&format!(
+                                    "Attached {} ({}, {})",
+                                    added.filename,
+                                    format_size(added.size),
+                                    prompt.selected.label()
+                                ));
+                            }
+                            Err(err) => {
+                                self.image_resize_prompt = None;
+                                self.status_message = Some(format!("Attach failed: {}", err));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.close_picker("Canceled");

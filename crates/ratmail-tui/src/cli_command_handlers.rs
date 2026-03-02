@@ -14,13 +14,13 @@ use serde_json::{Value as JsonValue, json};
 
 use super::{
     AccountConfig, AccountsCommand, CliCommand, FoldersCommand, MessageCommand, MessagesCommand,
-    account_id_for, cli_allows_account, cli_allows_attachments, cli_allows_body,
-    cli_allows_command, cli_allows_delete, cli_allows_folder, cli_allows_from, cli_allows_mark,
-    cli_allows_move, cli_allows_raw, cli_allows_send, allowed_fields, build_html_body, cc_from_raw,
-    filter_summary_to_json, load_cli_config, load_send_config, map_folder_names, maybe_fetch_raw,
-    output_error, output_ok, parse_before_ts, parse_from_addrs, parse_search_spec, parse_since_ts,
-    resolve_account, run_setup_wizard, spec_matches_attachments_cli, spec_matches_text_fields_cli,
-    to_from_raw,
+    account_id_for, allowed_fields, build_html_body, cc_from_raw, cli_allows_account,
+    cli_allows_attachments, cli_allows_body, cli_allows_command, cli_allows_delete,
+    cli_allows_folder, cli_allows_from, cli_allows_mark, cli_allows_move, cli_allows_raw,
+    cli_allows_send, filter_summary_to_json, load_cli_config, load_send_config, map_folder_names,
+    maybe_fetch_raw, output_error, output_ok, parse_before_ts, parse_from_addrs, parse_search_spec,
+    parse_since_ts, resolve_account, run_setup_wizard, spec_matches_attachments_cli,
+    spec_matches_text_fields_cli, to_from_raw,
 };
 
 pub(crate) fn run_cli(

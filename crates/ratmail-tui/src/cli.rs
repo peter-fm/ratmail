@@ -1,32 +1,32 @@
 use clap::{Args, Parser, Subcommand};
 
 use super::{
-    AccountConfig, CLI_SCHEMA_VERSION, RenderConfig, SearchSpec, SendConfig, SpellConfig,
-    UiConfig, build_html_body, cc_from_raw, extract_display, extract_email, load_config_text,
+    AccountConfig, CLI_SCHEMA_VERSION, RenderConfig, SearchSpec, SendConfig, SpellConfig, UiConfig,
+    build_html_body, cc_from_raw, extract_display, extract_email, load_config_text,
     mailaddrs_to_emails, normalize_ui_theme, parse_search_spec, parse_ui_palette, shell_split,
     to_from_raw,
 };
 
-#[path = "cli_guards.rs"]
-mod cli_guards;
 #[path = "cli_command_handlers.rs"]
 mod cli_command_handlers;
 #[path = "cli_config.rs"]
 mod cli_config;
+#[path = "cli_guards.rs"]
+mod cli_guards;
 #[path = "cli_message_filters.rs"]
 mod cli_message_filters;
 #[path = "cli_runtime_helpers.rs"]
 mod cli_runtime_helpers;
 #[path = "cli_setup.rs"]
 mod cli_setup;
-pub(crate) use cli_guards::{
-    cli_allows_account, cli_allows_attachments, cli_allows_body, cli_allows_command,
-    cli_allows_delete, cli_allows_folder, cli_allows_from, cli_allows_mark, cli_allows_move,
-    cli_allows_raw, cli_allows_send, allowed_fields,
-};
 pub(crate) use cli_command_handlers::run_cli;
 pub(crate) use cli_config::{
     load_cli_config, load_render_config, load_send_config, load_spell_config, load_ui_config,
+};
+pub(crate) use cli_guards::{
+    allowed_fields, cli_allows_account, cli_allows_attachments, cli_allows_body,
+    cli_allows_command, cli_allows_delete, cli_allows_folder, cli_allows_from, cli_allows_mark,
+    cli_allows_move, cli_allows_raw, cli_allows_send,
 };
 pub(crate) use cli_message_filters::{
     account_id_for, from_matches_filter, map_folder_names, maybe_fetch_raw, parse_before_ts,

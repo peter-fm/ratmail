@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use image::{DynamicImage, GenericImageView, ImageFormat, imageops::FilterType};
 use mime_guess::MimeGuess;
 use ratatui::widgets::{Block, Borders};
 use ratatui_explorer::{FileExplorer, Input as ExplorerInput, Theme as ExplorerTheme};
@@ -13,10 +14,10 @@ use ratmail_core::MailStore;
 use ratmail_mail::MailCommand;
 
 use super::{
-    App, ComposeAttachment, PICKER_IMAGE_PREVIEW_MAX_BYTES, PICKER_PDF_PREVIEW_MAX_BYTES,
-    PICKER_PREVIEW_MAX_BYTES, PickerFocus, PickerMode, PickerPreviewKind, format_size,
-    picker_meta_lines, render_pdf_first_page, safe_filename, text_char_len,
-    text_preview_from_bytes, zip_directory,
+    App, ComposeAttachment, ImageResizeOption, ImageResizePreset, ImageResizePrompt,
+    PICKER_IMAGE_PREVIEW_MAX_BYTES, PICKER_PDF_PREVIEW_MAX_BYTES, PICKER_PREVIEW_MAX_BYTES,
+    PickerFocus, PickerMode, PickerPreviewKind, format_size, picker_meta_lines,
+    render_pdf_first_page, safe_filename, text_char_len, text_preview_from_bytes, zip_directory,
 };
 
 impl App {
@@ -63,6 +64,7 @@ impl App {
         self.picker_filter.clear();
         self.picker_focus = PickerFocus::Explorer;
         self.reset_picker_preview();
+        self.image_resize_prompt = None;
         self.status_message = Some(status.to_string());
     }
 
@@ -313,6 +315,12 @@ impl App {
             return;
         }
         let target = current.path().clone();
+        if self.should_offer_image_resize_prompt(&target) {
+            if let Some(prompt) = self.build_image_resize_prompt(&target) {
+                self.image_resize_prompt = Some(prompt);
+                return;
+            }
+        }
         match self.add_compose_attachment_from_path(&target) {
             Ok(added) => {
                 self.close_picker(&format!(
@@ -369,30 +377,43 @@ impl App {
         &mut self,
         path: &Path,
     ) -> Result<ComposeAttachment> {
+        self.add_compose_attachment_from_path_with_preset(path, ImageResizePreset::Full)
+    }
+
+    pub(crate) fn add_compose_attachment_from_path_with_preset(
+        &mut self,
+        path: &Path,
+        preset: ImageResizePreset,
+    ) -> Result<ComposeAttachment> {
         if !path.exists() {
             return Err(anyhow::anyhow!("file not found"));
         }
         let attachment = if path.is_dir() {
             self.build_zip_attachment(path)?
         } else {
-            self.build_file_attachment(path)?
+            self.build_file_attachment(path, preset)?
         };
         self.compose_attachments.push(attachment.clone());
         Ok(attachment)
     }
 
-    pub(crate) fn build_file_attachment(&self, path: &Path) -> Result<ComposeAttachment> {
+    pub(crate) fn build_file_attachment(
+        &self,
+        path: &Path,
+        preset: ImageResizePreset,
+    ) -> Result<ComposeAttachment> {
         let filename = path
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("attachment")
             .to_string();
-        let data = std::fs::read(path)?;
-        let size = data.len();
+        let original = std::fs::read(path)?;
         let mime = MimeGuess::from_path(path)
             .first_or_octet_stream()
             .essence_str()
             .to_string();
+        let data = maybe_resize_image(path, &mime, &original, preset)?;
+        let size = data.len();
         Ok(ComposeAttachment {
             filename,
             mime,
@@ -485,5 +506,110 @@ impl App {
             .and_then(|m| self.store.folders.iter().find(|f| f.id == m.folder_id))
             .map(|f| f.name.clone());
         (uid, folder_name)
+    }
+
+    pub(crate) fn should_offer_image_resize_prompt(&self, path: &Path) -> bool {
+        if path.is_dir() {
+            return false;
+        }
+        let mime = MimeGuess::from_path(path)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string();
+        if !mime.starts_with("image/") {
+            return false;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff"
+        )
+    }
+
+    pub(crate) fn build_image_resize_prompt(&self, path: &Path) -> Option<ImageResizePrompt> {
+        let original = std::fs::read(path).ok()?;
+        let mime = MimeGuess::from_path(path)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string();
+        let options = ImageResizePreset::ordered()
+            .into_iter()
+            .map(|preset| {
+                let size_label = estimate_resized_size(path, &mime, &original, preset)
+                    .map(format_size)
+                    .unwrap_or_else(|_| "n/a".to_string());
+                ImageResizeOption { preset, size_label }
+            })
+            .collect();
+        Some(ImageResizePrompt {
+            path: path.to_path_buf(),
+            selected: ImageResizePreset::Full,
+            options,
+        })
+    }
+}
+
+fn maybe_resize_image(
+    path: &Path,
+    mime: &str,
+    original: &[u8],
+    preset: ImageResizePreset,
+) -> Result<Vec<u8>> {
+    let Some(max_dim) = preset.max_dimension_px() else {
+        return Ok(original.to_vec());
+    };
+    if !mime.starts_with("image/") {
+        return Ok(original.to_vec());
+    }
+    let img = image::load_from_memory(original)?;
+    let (w, h) = img.dimensions();
+    let largest = w.max(h);
+    if largest <= max_dim {
+        return Ok(original.to_vec());
+    }
+
+    let ratio = max_dim as f64 / largest as f64;
+    let new_w = ((w as f64) * ratio).round().max(1.0) as u32;
+    let new_h = ((h as f64) * ratio).round().max(1.0) as u32;
+    let resized = DynamicImage::ImageRgba8(image::imageops::resize(
+        &img,
+        new_w,
+        new_h,
+        FilterType::Lanczos3,
+    ));
+
+    let format = output_format_for_path(path);
+    let mut out = std::io::Cursor::new(Vec::new());
+    resized.write_to(&mut out, format)?;
+    Ok(out.into_inner())
+}
+
+fn estimate_resized_size(
+    path: &Path,
+    mime: &str,
+    original: &[u8],
+    preset: ImageResizePreset,
+) -> Result<usize> {
+    Ok(maybe_resize_image(path, mime, original, preset)?.len())
+}
+
+fn output_format_for_path(path: &Path) -> ImageFormat {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" => ImageFormat::Jpeg,
+        "png" => ImageFormat::Png,
+        "gif" => ImageFormat::Gif,
+        "webp" => ImageFormat::WebP,
+        "bmp" => ImageFormat::Bmp,
+        "tif" | "tiff" => ImageFormat::Tiff,
+        _ => ImageFormat::Png,
     }
 }
