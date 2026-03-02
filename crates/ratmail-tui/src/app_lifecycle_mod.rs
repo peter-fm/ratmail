@@ -46,6 +46,7 @@ impl App {
             store,
             folder_index: 0,
             message_index: 0,
+            message_scroll_top: 0,
             last_tick: Instant::now(),
             sync_status: "idle".to_string(),
             engine,

@@ -497,6 +497,7 @@ struct App {
     store: StoreSnapshot,
     folder_index: usize,
     message_index: usize,
+    message_scroll_top: usize,
     last_tick: Instant,
     sync_status: String,
     engine: MailEngine,
@@ -2289,15 +2290,36 @@ fn render_message_list(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let header =
         Row::new(vec!["S", "Att", "Time", "From", "Subject"]).style(app.ui_theme.table_header);
 
-    let visible = app.visible_messages();
-    let total = visible.len();
+    let total = app.visible_messages().len();
     let rows_visible = area.height.saturating_sub(2).max(1) as usize;
-    // Keep selection near the middle of the viewport for smoother up/down scrolling.
-    let mut start = app.message_index.saturating_sub(rows_visible / 2);
-    if start + rows_visible > total {
-        start = total.saturating_sub(rows_visible);
+    if total == 0 {
+        app.message_index = 0;
+        app.message_scroll_top = 0;
+    } else if app.message_index >= total {
+        app.message_index = total - 1;
     }
+    let max_start = total.saturating_sub(rows_visible);
+    if app.message_scroll_top > max_start {
+        app.message_scroll_top = max_start;
+    }
+    if app.message_index < app.message_scroll_top {
+        app.message_scroll_top = app.message_index;
+    } else {
+        let bottom = app
+            .message_scroll_top
+            .saturating_add(rows_visible.saturating_sub(1));
+        if app.message_index > bottom {
+            app.message_scroll_top = app
+                .message_index
+                .saturating_sub(rows_visible.saturating_sub(1));
+        }
+    }
+    if app.message_scroll_top > max_start {
+        app.message_scroll_top = max_start;
+    }
+    let start = app.message_scroll_top.min(max_start);
     let end = (start + rows_visible).min(total);
+    let visible = app.visible_messages();
     let visible_ids: Vec<i64> = visible[start..end].iter().map(|m| m.id).collect();
     drop(visible);
     app.prefetch_visible_attachments(&visible_ids, 5);
