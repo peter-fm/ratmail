@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use anyhow::anyhow;
 use ratmail_content::prepare_html;
 use ratmail_core::{MailStore, SqliteMailStore, TileMeta, log_debug};
 use ratmail_render::{RemotePolicy, Renderer};
@@ -33,6 +36,16 @@ pub(crate) async fn render_worker(
     store: SqliteMailStore,
     renderer: Arc<dyn Renderer>,
 ) {
+    let max_failures = std::env::var("RATMAIL_RENDER_FAIL_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(2);
+    let cooldown_secs = std::env::var("RATMAIL_RENDER_FAIL_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5 * 60);
+    let mut failures: HashMap<i64, (u32, Option<Instant>)> = HashMap::new();
+
     loop {
         if rx.changed().await.is_err() {
             break;
@@ -49,6 +62,34 @@ pub(crate) async fn render_worker(
         for message_id in request.message_ids {
             if rx.borrow().request_id != current_id {
                 break;
+            }
+            if let Some((_, Some(until))) = failures.get(&message_id) {
+                if Instant::now() < *until {
+                    let remaining = until.saturating_duration_since(Instant::now()).as_secs();
+                    let msg = format!(
+                        "Skipping render for this message for {}s due to repeated failures",
+                        remaining
+                    );
+                    if tx
+                        .send(RenderEvent {
+                            message_id,
+                            tiles: Vec::new(),
+                            tile_height_px: request.tile_height_px,
+                            width_px: request.width_px,
+                            no_html: false,
+                            error: Some(msg.clone()),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    log_debug(&format!(
+                        "render_worker breaker skip msg_id={} remaining={}s",
+                        message_id, remaining
+                    ));
+                    continue;
+                }
             }
 
             log_debug(&format!(
@@ -175,8 +216,13 @@ pub(crate) async fn render_worker(
                 }
             }
 
-            let render_result = renderer
-                .render(ratmail_render::RenderRequest {
+            let render_timeout_secs = std::env::var("RATMAIL_RENDER_JOB_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(10);
+            let render_result = match tokio::time::timeout(
+                Duration::from_secs(render_timeout_secs),
+                renderer.render(ratmail_render::RenderRequest {
                     message_id,
                     width_px: request.width_px,
                     tile_height_px: request.tile_height_px,
@@ -188,11 +234,20 @@ pub(crate) async fn render_worker(
                         RemotePolicy::Blocked
                     },
                     prepared_html: &html,
-                })
-                .await;
+                }),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    ratmail_render::reset_chromium_pool();
+                    Err(anyhow!("Render timed out after {}s", render_timeout_secs))
+                }
+            };
 
             match render_result {
                 Ok(result) => {
+                    failures.remove(&message_id);
                     if result.tiles.is_empty() {
                         if tx
                             .send(RenderEvent {
@@ -242,6 +297,20 @@ pub(crate) async fn render_worker(
                     ));
                 }
                 Err(err) => {
+                    ratmail_render::reset_chromium_pool();
+                    let entry = failures.entry(message_id).or_insert((0, None));
+                    entry.0 += 1;
+                    let mut err_text = err.to_string();
+                    if entry.0 >= max_failures {
+                        entry.0 = 0;
+                        entry.1 = Some(Instant::now() + Duration::from_secs(cooldown_secs));
+                        err_text = format!(
+                            "{}; temporarily skipping this message for {}s",
+                            err_text, cooldown_secs
+                        );
+                    } else {
+                        entry.1 = None;
+                    }
                     if tx
                         .send(RenderEvent {
                             message_id,
@@ -249,7 +318,7 @@ pub(crate) async fn render_worker(
                             tile_height_px: request.tile_height_px,
                             width_px: request.width_px,
                             no_html: false,
-                            error: Some(err.to_string()),
+                            error: Some(err_text.clone()),
                         })
                         .await
                         .is_err()
@@ -257,8 +326,8 @@ pub(crate) async fn render_worker(
                         return;
                     }
                     log_debug(&format!(
-                        "render_worker render error msg_id={} err={}",
-                        message_id, err
+                        "render_worker render error msg_id={} failures={} err={}",
+                        message_id, entry.0, err_text
                     ));
                 }
             }
