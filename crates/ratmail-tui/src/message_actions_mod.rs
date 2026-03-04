@@ -156,11 +156,22 @@ impl App {
     }
 
     pub(crate) fn ensure_text_cache_for_selected(&mut self) {
+        self.ensure_text_cache_for_selected_width(DEFAULT_TEXT_WIDTH);
+    }
+
+    pub(crate) fn ensure_text_cache_for_selected_width(&mut self, width_cols: i64) {
         let Some(message) = self.selected_message() else {
             return;
         };
-        if let Some(detail) = self.store.message_details.get(&message.id) {
-            if !detail.body.is_empty() && !detail.links.is_empty() {
+        let width_cols = width_cols.max(1);
+        if self.text_view_cache_key == Some((message.id, width_cols)) {
+            if self
+                .store
+                .message_details
+                .get(&message.id)
+                .map(|d| !d.body.is_empty())
+                .unwrap_or(false)
+            {
                 return;
             }
         }
@@ -169,23 +180,30 @@ impl App {
         let message_id = message.id;
         let store_handle = self.store_handle.clone();
         let result = self.runtime().block_on(async move {
+            if let Some(text) = store_handle.get_message_text(message_id, width_cols).await? {
+                return Ok::<_, anyhow::Error>(Some((None, None, None, Some(text))));
+            }
             if let Some(raw) = store_handle.get_raw_body(message_id).await? {
-                let display = extract_display(&raw, DEFAULT_TEXT_WIDTH as usize)?;
+                let display = extract_display(&raw, width_cols as usize)?;
                 let to = to_from_raw(&raw);
                 let cc = cc_from_raw(&raw);
                 store_handle
-                    .upsert_cache_text(message_id, DEFAULT_TEXT_WIDTH, &display.text)
+                    .upsert_cache_text(message_id, width_cols, &display.text)
                     .await?;
-                Ok::<_, anyhow::Error>(Some((display, to, cc)))
+                Ok::<_, anyhow::Error>(Some((Some(display), to, cc, None)))
             } else {
                 Ok::<_, anyhow::Error>(None)
             }
         });
 
-        if let Ok(Some((display, to, cc))) = result {
+        if let Ok(Some((display, to, cc, cached_text))) = result {
             if let Some(detail) = self.store.message_details.get_mut(&message_id) {
-                detail.body = display.text;
-                detail.links = display.links;
+                if let Some(cached_text) = cached_text {
+                    detail.body = cached_text;
+                } else if let Some(display) = display.as_ref() {
+                    detail.body = display.text.clone();
+                    detail.links = display.links.clone();
+                }
                 if let Some(to) = &to {
                     detail.to = to.clone();
                 }
@@ -193,6 +211,13 @@ impl App {
                     detail.cc = cc.clone();
                 }
             } else if let Some(summary) = self.selected_message() {
+                let (body, links) = if let Some(cached_text) = cached_text {
+                    (cached_text, Vec::new())
+                } else if let Some(display) = display {
+                    (display.text, display.links)
+                } else {
+                    (String::new(), Vec::new())
+                };
                 self.store.message_details.insert(
                     message_id,
                     MessageDetail {
@@ -202,12 +227,13 @@ impl App {
                         to: to.clone().unwrap_or_default(),
                         cc: cc.clone().unwrap_or_default(),
                         date: summary.date.clone(),
-                        body: display.text,
-                        links: display.links,
+                        body,
+                        links,
                         attachments: Vec::new(),
                     },
                 );
             }
+            self.text_view_cache_key = Some((message_id, width_cols));
             if let Some(to) = to.as_deref() {
                 let _ = self
                     .runtime()

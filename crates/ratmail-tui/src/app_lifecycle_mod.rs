@@ -43,6 +43,7 @@ impl App {
             mode: Mode::List,
             focus: Focus::Messages,
             view_mode: ViewMode::Text,
+            text_view_cache_key: None,
             store,
             folder_index: 0,
             message_index: 0,
@@ -268,6 +269,7 @@ impl App {
             let prev_folder = self.selected_folder().map(|f| f.name.clone());
             let prev_uid = self.selected_message().and_then(|m| m.imap_uid);
             self.store = snapshot;
+            self.text_view_cache_key = None;
             self.sort_folders();
             self.refresh_compose_address_book();
             self.reapply_attachment_cache();

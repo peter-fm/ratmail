@@ -540,6 +540,7 @@ struct App {
     mode: Mode,
     focus: Focus,
     view_mode: ViewMode,
+    text_view_cache_key: Option<(i64, i64)>,
     store: StoreSnapshot,
     folder_index: usize,
     message_index: usize,
@@ -2837,6 +2838,10 @@ fn render_logo_palette(theme: &UiTheme) -> [Color; 6] {
 }
 
 fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, scroll: u16) {
+    if app.view_mode == ViewMode::Text {
+        let width_cols = i64::from(area.width.max(1));
+        app.ensure_text_cache_for_selected_width(width_cols);
+    }
     let detail = app.selected_detail().cloned();
     let view_mode = app.view_mode;
     let render_supported = app.render_supported;
