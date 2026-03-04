@@ -12,6 +12,10 @@ use super::{
     StoreUpdate, UiTheme, ViewMode, canonical_folder_name, compose_buffer_from_body,
 };
 
+const MAX_MAIL_EVENTS_PER_FRAME: usize = 32;
+const MAX_STORE_SNAPSHOTS_PER_FRAME: usize = 2;
+const MAX_RENDER_EVENTS_PER_FRAME: usize = 8;
+
 impl App {
     pub(crate) fn new(
         store: StoreSnapshot,
@@ -262,25 +266,36 @@ impl App {
     }
 
     pub(crate) fn drain_channels(&mut self) {
-        while let Ok(event) = self.events.try_recv() {
-            self.on_event(event);
-        }
-        while let Ok(snapshot) = self.store_updates.try_recv() {
-            let prev_folder = self.selected_folder().map(|f| f.name.clone());
-            let prev_uid = self.selected_message().and_then(|m| m.imap_uid);
-            self.store = snapshot;
-            self.text_view_cache_key = None;
-            self.sort_folders();
-            self.refresh_compose_address_book();
-            self.reapply_attachment_cache();
-            self.restore_selection(prev_folder, prev_uid);
-            self.prune_selected_messages();
-            if self.store.folders.is_empty() {
-                self.select_inbox_if_available();
+        for _ in 0..MAX_MAIL_EVENTS_PER_FRAME {
+            match self.events.try_recv() {
+                Ok(event) => self.on_event(event),
+                Err(_) => break,
             }
         }
-        while let Ok(event) = self.render_events.try_recv() {
-            self.on_render_event(event);
+        for _ in 0..MAX_STORE_SNAPSHOTS_PER_FRAME {
+            match self.store_updates.try_recv() {
+                Ok(snapshot) => {
+                    let prev_folder = self.selected_folder().map(|f| f.name.clone());
+                    let prev_uid = self.selected_message().and_then(|m| m.imap_uid);
+                    self.store = snapshot;
+                    self.text_view_cache_key = None;
+                    self.sort_folders();
+                    self.refresh_compose_address_book();
+                    self.reapply_attachment_cache();
+                    self.restore_selection(prev_folder, prev_uid);
+                    self.prune_selected_messages();
+                    if self.store.folders.is_empty() {
+                        self.select_inbox_if_available();
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        for _ in 0..MAX_RENDER_EVENTS_PER_FRAME {
+            match self.render_events.try_recv() {
+                Ok(event) => self.on_render_event(event),
+                Err(_) => break,
+            }
         }
     }
 
