@@ -74,7 +74,7 @@ impl App {
                 .and_then(|s| s.oldest_ts)
         });
         let Some(before_ts) = oldest_ts else {
-            self.status_message = Some("No older messages cached yet.".to_string());
+            self.set_status("No older messages cached yet.");
             return;
         };
         self.imap_pending = self.imap_pending.saturating_add(1);
@@ -95,10 +95,10 @@ impl App {
             MailEvent::SyncCompleted(_) => self.sync_status = "idle".to_string(),
             MailEvent::SyncFailed { .. } => self.sync_status = "error".to_string(),
             MailEvent::SendStarted => {
-                self.status_message = Some("Sending...".to_string());
+                self.set_status("Sending...");
             }
             MailEvent::SendCompleted => {
-                self.status_message = Some("Sent".to_string());
+                self.set_status("Sent");
                 if self.mode == Mode::Compose {
                     self.mode = Mode::List;
                     self.focus = Focus::Messages;
@@ -119,7 +119,7 @@ impl App {
                 }
             }
             MailEvent::SendFailed { reason } => {
-                self.status_message = Some(format!("Send failed: {}", reason));
+                self.set_status(format!("Send failed: {}", reason));
             }
             MailEvent::ImapFolders(folders) => {
                 self.imap_pending = self.imap_pending.saturating_sub(1);

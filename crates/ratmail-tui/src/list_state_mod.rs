@@ -431,7 +431,7 @@ impl App {
         }
         let count = self.selected_message_ids.len();
         if count > 0 {
-            self.status_message = Some(format!(
+            self.set_status(format!(
                 "Selected {} message{}",
                 count,
                 if count == 1 { "" } else { "s" }

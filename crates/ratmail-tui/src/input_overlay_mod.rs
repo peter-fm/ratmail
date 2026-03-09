@@ -92,7 +92,7 @@ impl App {
             (KeyCode::Char('p'), _) => {
                 self.show_preview = !self.show_preview;
             }
-            (KeyCode::Char('?'), _) => {
+            (KeyCode::Char('?'), _) | (KeyCode::F(1), _) => {
                 self.show_help = !self.show_help;
             }
             (KeyCode::Char('o'), _) => {
@@ -102,15 +102,19 @@ impl App {
                 self.request_sync_selected_folder();
             }
             (KeyCode::Esc, _) => {
-                self.mode = Mode::View;
-                self.render_tile_height_px = self.render_tile_height_px_side;
-                if self.view_mode == ViewMode::Rendered {
-                    self.render_tiles.clear();
-                    self.render_tile_count = 0;
-                    self.render_tiles_height_px = 0;
-                    self.render_tiles_width_px = 0;
-                    self.render_message_id = None;
-                    self.schedule_render();
+                if self.show_help {
+                    self.show_help = false;
+                } else {
+                    self.mode = Mode::View;
+                    self.render_tile_height_px = self.render_tile_height_px_side;
+                    if self.view_mode == ViewMode::Rendered {
+                        self.render_tiles.clear();
+                        self.render_tile_count = 0;
+                        self.render_tiles_height_px = 0;
+                        self.render_tiles_width_px = 0;
+                        self.render_message_id = None;
+                        self.schedule_render();
+                    }
                 }
             }
             _ => {}
@@ -152,14 +156,14 @@ impl App {
 
     fn copy_to_clipboard(&mut self, text: &str) {
         if copy_with_osc52(text) {
-            self.status_message = Some("Copied link".to_string());
+            self.set_status("Copied link");
             return;
         }
         if copy_with_command(text) {
-            self.status_message = Some("Copied link".to_string());
+            self.set_status("Copied link");
             return;
         }
-        self.status_message = Some("Clipboard copy failed".to_string());
+        self.set_status("Clipboard copy failed");
     }
 
     pub(crate) fn on_key_overlay(&mut self, key: KeyEvent) -> bool {

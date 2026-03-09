@@ -22,11 +22,11 @@ impl App {
         }
         if ctrl && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
             if self.compose_attachments.is_empty() {
-                self.status_message = Some("No attachments to remove".to_string());
+                self.set_status("No attachments to remove");
             } else {
                 let removed = self.compose_attachments.pop();
                 if let Some(removed) = removed {
-                    self.status_message = Some(format!("Removed attachment {}", removed.filename));
+                    self.set_status(format!("Removed attachment {}", removed.filename));
                 }
             }
             return false;
@@ -54,9 +54,9 @@ impl App {
                 })
                 .collect();
             if to.trim().is_empty() && cc.trim().is_empty() && bcc.trim().is_empty() {
-                self.status_message = Some("No recipient".to_string());
+                self.set_status("No recipient");
             } else {
-                self.status_message = Some("Sending...".to_string());
+                self.set_status("Sending...");
                 let _ = self.engine.send(MailCommand::SendMessage {
                     to,
                     cc,
@@ -71,6 +71,10 @@ impl App {
         }
         if matches!(key.code, KeyCode::F(7)) {
             self.open_spellcheck_overlay();
+            return false;
+        }
+        if matches!(key.code, KeyCode::F(1)) {
+            self.show_help = !self.show_help;
             return false;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q')) {
@@ -122,7 +126,7 @@ impl App {
             {
                 self.inline_spell_suggest = self.build_inline_spell_suggest();
                 if self.inline_spell_suggest.is_none() {
-                    self.status_message = Some("No spelling suggestions".to_string());
+                    self.set_status("No spelling suggestions");
                 }
                 return false;
             }
@@ -422,13 +426,13 @@ impl App {
 
     fn open_spellcheck_overlay(&mut self) {
         let Some(dict) = spell_dictionary() else {
-            self.status_message = Some("Spellcheck unavailable (dictionary not found)".to_string());
+            self.set_status("Spellcheck unavailable (dictionary not found)");
             return;
         };
         self.spell_issues =
             collect_spell_issues(&self.compose_subject, &self.compose_body_text(), dict);
         if self.spell_issues.is_empty() {
-            self.status_message = Some("Spellcheck: no issues found".to_string());
+            self.set_status("Spellcheck: no issues found");
             return;
         }
         self.spell_issue_index = 0;
@@ -441,7 +445,7 @@ impl App {
         let Some(dict) = spell_dictionary() else {
             self.spell_issues.clear();
             self.mode = self.spell_return;
-            self.status_message = Some("Spellcheck unavailable (dictionary not found)".to_string());
+            self.set_status("Spellcheck unavailable (dictionary not found)");
             return;
         };
         let prev = self.spell_issue_index;
@@ -449,7 +453,7 @@ impl App {
             collect_spell_issues(&self.compose_subject, &self.compose_body_text(), dict);
         if self.spell_issues.is_empty() {
             self.mode = self.spell_return;
-            self.status_message = Some("Spellcheck: no issues found".to_string());
+            self.set_status("Spellcheck: no issues found");
             return;
         }
         self.spell_issue_index = prev.min(self.spell_issues.len().saturating_sub(1));
@@ -468,10 +472,10 @@ impl App {
             return false;
         };
         if let Err(err) = add_spell_ignore_word(&issue.word) {
-            self.status_message = Some(format!("Spell ignore failed: {}", err));
+            self.set_status(format!("Spell ignore failed: {}", err));
             return false;
         }
-        self.status_message = Some(format!("Ignored word: {}", issue.word));
+        self.set_status(format!("Ignored word: {}", issue.word));
         true
     }
 
@@ -642,7 +646,7 @@ impl App {
                             }
                             Err(err) => {
                                 self.image_resize_prompt = None;
-                                self.status_message = Some(format!("Attach failed: {}", err));
+                                self.set_status(format!("Attach failed: {}", err));
                             }
                         }
                     }
@@ -728,7 +732,7 @@ impl App {
                                 }
                                 Err(err) => {
                                     if err.to_string() != "message body not cached" {
-                                        self.status_message = Some(format!("Save failed: {}", err));
+                                        self.set_status(format!("Save failed: {}", err));
                                     }
                                 }
                             }

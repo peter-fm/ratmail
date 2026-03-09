@@ -33,7 +33,7 @@ impl App {
         let mut picker = match FileExplorer::with_theme(theme) {
             Ok(picker) => picker,
             Err(err) => {
-                self.status_message = Some(format!("Picker error: {}", err));
+                self.set_status(format!("Picker error: {}", err));
                 return;
             }
         };
@@ -65,7 +65,7 @@ impl App {
         self.picker_focus = PickerFocus::Explorer;
         self.reset_picker_preview();
         self.image_resize_prompt = None;
-        self.status_message = Some(status.to_string());
+        self.set_status(status);
     }
 
     pub(crate) fn handle_picker_navigation(&mut self, key: KeyEvent) {
@@ -311,7 +311,7 @@ impl App {
         };
         let current = picker.current();
         if current.is_placeholder() {
-            self.status_message = Some("No matching files to attach.".to_string());
+            self.set_status("No matching files to attach.");
             return;
         }
         let target = current.path().clone();
@@ -330,7 +330,7 @@ impl App {
                 ));
             }
             Err(err) => {
-                self.status_message = Some(format!("Attach failed: {}", err));
+                self.set_status(format!("Attach failed: {}", err));
             }
         }
     }
@@ -347,11 +347,11 @@ impl App {
         match self.save_attachment_to_temp(message_id, self.attach_index, &filename) {
             Ok(path) => {
                 let _ = open::that(&path);
-                self.status_message = Some(format!("Opened {}", path.display()));
+                self.set_status(format!("Opened {}", path.display()));
             }
             Err(err) => {
                 if err.to_string() != "message body not cached" {
-                    self.status_message = Some(format!("Open failed: {}", err));
+                    self.set_status(format!("Open failed: {}", err));
                 }
             }
         }
@@ -493,7 +493,7 @@ impl App {
                     folder_name,
                     uid,
                 });
-                self.status_message = Some("Fetching body...".to_string());
+                self.set_status("Fetching body...");
             }
         }
         Err(anyhow::anyhow!("message body not cached"))

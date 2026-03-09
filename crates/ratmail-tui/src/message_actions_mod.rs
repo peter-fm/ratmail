@@ -2,9 +2,31 @@ use ratmail_content::{extract_attachments, extract_display};
 use ratmail_core::{DEFAULT_TEXT_WIDTH, LinkInfo, MailStore, MessageDetail};
 use ratmail_mail::MailCommand;
 
-use super::{App, Mode, StoreUpdate, cc_from_raw, to_from_raw};
+use super::{App, Mode, StoreUpdate, cc_from_raw, copy_to_clipboard, detect_auth_code, to_from_raw};
 
 impl App {
+    pub(crate) fn copy_auth_code_for_selected(&mut self) {
+        self.ensure_text_cache_for_selected();
+        let Some(detail) = self.selected_detail() else {
+            self.set_status("No message selected");
+            return;
+        };
+
+        let Some(code) = detect_auth_code(&detail.subject, &detail.body) else {
+            self.set_status("No auth code found in this message");
+            return;
+        };
+
+        if copy_to_clipboard(&code.value) {
+            self.set_status(format!("Copied auth code: {}", code.value));
+        } else {
+            self.set_status(format!(
+                "Found auth code {} but clipboard copy failed",
+                code.value
+            ));
+        }
+    }
+
     pub(crate) fn open_bulk_action_overlay(&mut self, ids: Vec<i64>) {
         if ids.is_empty() {
             return;
@@ -67,7 +89,7 @@ impl App {
             return;
         }
         if Some(target_folder_id) == self.selected_folder().map(|f| f.id) {
-            self.status_message = Some("Already in that folder".to_string());
+            self.set_status("Already in that folder");
             return;
         }
         let account_id = self.store.account.id;
@@ -100,7 +122,7 @@ impl App {
         }
 
         self.clear_selected_messages();
-        self.status_message = Some(format!(
+        self.set_status(format!(
             "Moved {} message{}",
             ids.len(),
             if ids.len() == 1 { "" } else { "s" }
@@ -131,7 +153,7 @@ impl App {
         }
 
         self.clear_selected_messages();
-        self.status_message = Some(format!(
+        self.set_status(format!(
             "Deleted {} message{}",
             ids.len(),
             if ids.len() == 1 { "" } else { "s" }
@@ -152,7 +174,7 @@ impl App {
         });
 
         self.clear_selected_messages();
-        self.status_message = Some("Marked selected messages as read".to_string());
+        self.set_status("Marked selected messages as read");
     }
 
     pub(crate) fn ensure_text_cache_for_selected(&mut self) {
@@ -251,7 +273,7 @@ impl App {
                     folder_name,
                     uid,
                 });
-                self.status_message = Some("Fetching body...".to_string());
+                self.set_status("Fetching body...");
             }
         }
     }
@@ -281,7 +303,7 @@ impl App {
                     folder_name,
                     uid,
                 });
-                self.status_message = Some("Fetching body...".to_string());
+                self.set_status("Fetching body...");
             }
         }
         false
@@ -358,7 +380,7 @@ impl App {
                     folder_name,
                     uid,
                 });
-                self.status_message = Some("Fetching body...".to_string());
+                self.set_status("Fetching body...");
             }
         }
     }

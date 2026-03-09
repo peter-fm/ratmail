@@ -187,21 +187,7 @@ pub(crate) fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app
     frame.render_widget(Paragraph::new(line).style(app.ui_theme.separator), rows[5]);
     render_compose_body(frame, rows[6], app);
 
-    let close_hint = if app.compose_vim_enabled {
-        "Ctrl+Q close"
-    } else {
-        "Ctrl+Q/Esc close"
-    };
-    let base_footer = format!(
-        "Ctrl+S/F5 send   F7 spell   Ctrl+Space suggest   Ctrl+A attach   Ctrl+R remove last   Tab next   Shift+Tab prev   Right accept   {}",
-        close_hint
-    );
-    let footer = if let Some(msg) = &app.status_message {
-        format!("{}   | {}", base_footer, msg)
-    } else {
-        base_footer
-    };
-    frame.render_widget(Paragraph::new(footer).style(app.ui_theme.base), rows[7]);
+    frame.render_widget(Paragraph::new("Ctrl+S send   F1 help").style(app.ui_theme.base), rows[7]);
 
     match app.compose_focus {
         ComposeFocus::To => {

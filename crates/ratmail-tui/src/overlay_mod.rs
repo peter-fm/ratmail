@@ -659,3 +659,92 @@ fn render_picker_preview(frame: &mut ratatui::Frame, area: Rect, app: &mut App) 
         }
     }
 }
+
+pub(crate) fn render_help_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let popup = centered_rect(60, 60, area);
+    frame.render_widget(Clear, popup);
+
+    let bold = Style::default().add_modifier(ratatui::style::Modifier::BOLD);
+    let lines = if app.mode == super::Mode::Compose {
+        vec![
+            Line::from(Span::styled("Compose", bold)),
+            Line::from("  Ctrl+S / F5     send message"),
+            Line::from("  F7              spellcheck"),
+            Line::from("  Ctrl+Space      autocomplete suggestion"),
+            Line::from("  Ctrl+A          attach file"),
+            Line::from("  Ctrl+R          remove last attachment"),
+            Line::from("  Tab             next field"),
+            Line::from("  Shift+Tab       previous field"),
+            Line::from("  Right           accept suggestion"),
+            Line::from(if app.compose_vim_enabled {
+                "  Ctrl+Q          close compose"
+            } else {
+                "  Ctrl+Q / Esc    close compose"
+            }),
+            Line::from(""),
+            Line::from("Press F1 to close"),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled("Navigation", bold)),
+            Line::from("  Tab / h / l     switch focus (folders / messages)"),
+            Line::from("  j / k           move down / up"),
+            Line::from("  Enter           open message or bulk actions"),
+            Line::from("  Space           select message + move next"),
+            Line::from("  Esc             clear selection / close"),
+            Line::from(""),
+            Line::from(Span::styled("Viewing", bold)),
+            Line::from("  v               toggle view mode (text / rendered)"),
+            Line::from("  p               toggle preview pane"),
+            Line::from("  l               show links"),
+            Line::from("  a               show attachments"),
+            Line::from("  y               copy auth code"),
+            Line::from(""),
+            Line::from(Span::styled("Actions", bold)),
+            Line::from("  r               reply"),
+            Line::from("  R               reply all"),
+            Line::from("  f               forward"),
+            Line::from("  c               compose new"),
+            Line::from("  m               move to folder"),
+            Line::from("  d               delete"),
+            Line::from(""),
+            Line::from(Span::styled("Other", bold)),
+            Line::from("  s               sync folder"),
+            Line::from("  o               fetch older messages"),
+            Line::from("  /               search"),
+            Line::from("  [ ]             switch account"),
+            Line::from("  q               quit"),
+            Line::from(""),
+            Line::from("Press ? or Esc to close"),
+        ]
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("KEYMAP")
+        .style(app.ui_theme.base)
+        .border_style(app.ui_theme.border);
+    let paragraph = Paragraph::new(Text::from(lines))
+        .style(app.ui_theme.base)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
+}
+
+pub(crate) fn render_toast(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    if let Some(msg) = &app.status_message {
+        let width = (msg.len() as u16 + 4).min(area.width.saturating_sub(2));
+        let x = area.right().saturating_sub(width + 1);
+        let y = area.bottom().saturating_sub(4);
+        let rect = Rect::new(x, y, width, 3);
+        frame.render_widget(Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .style(app.ui_theme.bar)
+            .border_style(app.ui_theme.border);
+        let paragraph = Paragraph::new(msg.as_str())
+            .style(app.ui_theme.bar)
+            .block(block);
+        frame.render_widget(paragraph, rect);
+    }
+}

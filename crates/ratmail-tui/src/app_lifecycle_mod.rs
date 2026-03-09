@@ -103,6 +103,7 @@ impl App {
             link_index: 0,
             attach_index: 0,
             status_message: None,
+            status_message_at: None,
             search_query: String::new(),
             search_cursor: 0,
             search_spec: SearchSpec::default(),
@@ -299,7 +300,18 @@ impl App {
         }
     }
 
+    pub(crate) fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        self.status_message_at = Some(Instant::now());
+    }
+
     pub(crate) fn on_tick(&mut self) {
+        if let Some(at) = self.status_message_at {
+            if at.elapsed() >= std::time::Duration::from_secs(3) {
+                self.status_message = None;
+                self.status_message_at = None;
+            }
+        }
         if self.imap_enabled && self.last_folder_sync.is_none() {
             self.select_inbox_if_available();
             self.request_sync_selected_folder();

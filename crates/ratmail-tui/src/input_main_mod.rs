@@ -127,7 +127,9 @@ impl App {
                 }
             }
             (KeyCode::Esc, _) => {
-                if !self.selected_message_ids.is_empty() {
+                if self.show_help {
+                    self.show_help = false;
+                } else if !self.selected_message_ids.is_empty() {
                     self.clear_selected_messages();
                 } else if self.search_active() {
                     self.clear_search();
@@ -212,10 +214,15 @@ impl App {
                     self.open_confirm_delete(ids, self.mode);
                 }
             }
+            (KeyCode::Char('y'), _) => {
+                if self.focus == Focus::Messages {
+                    self.copy_auth_code_for_selected();
+                }
+            }
             (KeyCode::Char('p'), _) => {
                 self.show_preview = !self.show_preview;
             }
-            (KeyCode::Char('?'), _) => {
+            (KeyCode::Char('?'), _) | (KeyCode::F(1), _) => {
                 self.show_help = !self.show_help;
             }
             (KeyCode::Char('o'), _) => {

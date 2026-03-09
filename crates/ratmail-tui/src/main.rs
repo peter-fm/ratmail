@@ -75,8 +75,8 @@ use crate::message_parse_mod::{
 use crate::overlay_mod::{
     render_attach_overlay, render_bulk_action_overlay, render_bulk_move_overlay,
     render_confirm_delete_overlay, render_confirm_draft_overlay, render_confirm_link_overlay,
-    render_image_resize_overlay, render_links_overlay, render_picker_overlay,
-    render_search_overlay, render_spellcheck_overlay,
+    render_help_overlay, render_image_resize_overlay, render_links_overlay, render_toast,
+    render_picker_overlay, render_search_overlay, render_spellcheck_overlay,
 };
 use crate::render_mod::{RenderEvent, RenderRequest, render_worker};
 use crate::util_mod::{
@@ -596,6 +596,7 @@ struct App {
     link_index: usize,
     attach_index: usize,
     status_message: Option<String>,
+    status_message_at: Option<Instant>,
     search_query: String,
     search_cursor: usize,
     search_spec: SearchSpec,
@@ -2171,19 +2172,16 @@ fn ui(frame: &mut ratatui::Frame, multi: &mut MultiApp) {
     let app = multi.current_mut();
     let area = frame.area();
     frame.render_widget(Block::default().style(app.ui_theme.base), area);
-    let help_height = if app.show_help { 3 } else { 2 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
-            Constraint::Length(help_height),
         ])
         .split(area);
 
     render_status_bar(frame, layout[0], app, &labels, current_idx);
     render_main(frame, layout[1], app);
-    render_help_bar(frame, layout[2], app);
 
     match app.mode {
         Mode::OverlayLinks => render_links_overlay(frame, area, app),
@@ -2206,6 +2204,12 @@ fn ui(frame: &mut ratatui::Frame, multi: &mut MultiApp) {
             render_image_resize_overlay(frame, area, app);
         }
     }
+
+    if app.show_help {
+        render_help_overlay(frame, area, app);
+    }
+
+    render_toast(frame, area, app);
 }
 
 fn render_status_bar(
@@ -2245,9 +2249,7 @@ fn render_status_bar(
     } else {
         spans.push(Span::raw(" [/] search "));
     }
-    if let Some(msg) = &app.status_message {
-        spans.push(Span::raw(format!(" | {}", msg)));
-    }
+    spans.push(Span::raw(" [?] help "));
     if let Some(msg) = &app.imap_status {
         spans.push(Span::raw(format!(" | {}", msg)));
     }
@@ -2658,6 +2660,169 @@ fn copy_with_command(text: &str) -> bool {
     false
 }
 
+fn copy_to_clipboard(text: &str) -> bool {
+    copy_with_command(text) || copy_with_osc52(text)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthCodeMatch {
+    value: String,
+    score: i32,
+}
+
+fn detect_auth_code(subject: &str, body: &str) -> Option<AuthCodeMatch> {
+    let context = if subject.trim().is_empty() {
+        body.to_string()
+    } else if body.trim().is_empty() {
+        subject.to_string()
+    } else {
+        format!("{subject}\n{body}")
+    };
+    let has_auth_context = contains_auth_keyword(&context);
+    let mut best: Option<AuthCodeMatch> = None;
+    for line in context.lines() {
+        let line_has_auth = contains_auth_keyword(line);
+        for candidate in auth_code_candidates_in_line(line) {
+            let mut score = candidate_score(&candidate);
+            if has_auth_context {
+                score += 15;
+            }
+            if line_has_auth {
+                score += 40;
+            }
+            if best.as_ref().map(|current| score > current.score).unwrap_or(true) {
+                best = Some(AuthCodeMatch {
+                    value: candidate,
+                    score,
+                });
+            }
+        }
+    }
+    best.filter(|code| code.score >= 25)
+}
+
+fn contains_auth_keyword(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "code",
+        "passcode",
+        "otp",
+        "2fa",
+        "mfa",
+        "auth",
+        "authentication",
+        "verify",
+        "verification",
+        "one-time",
+        "one time",
+        "security code",
+        "sign in",
+        "login",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword))
+}
+
+fn auth_code_candidates_in_line(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        if !chars[idx].is_ascii_alphanumeric() {
+            idx += 1;
+            continue;
+        }
+        let start = idx;
+        let mut end = idx;
+        while end < chars.len()
+            && (chars[end].is_ascii_alphanumeric() || chars[end] == ' ' || chars[end] == '-')
+        {
+            end += 1;
+        }
+        let raw = chars[start..end].iter().collect::<String>();
+        if let Some(code) = normalize_auth_code_candidate(&raw) {
+            if !out.iter().any(|existing| existing == &code) {
+                out.push(code);
+            }
+        }
+        idx = end.saturating_add(1);
+    }
+    out
+}
+
+fn normalize_auth_code_candidate(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    if normalized.len() < 4 || normalized.len() > 10 {
+        return None;
+    }
+    let has_digit = normalized.chars().any(|ch| ch.is_ascii_digit());
+    if !has_digit {
+        return None;
+    }
+    let all_digits = normalized.chars().all(|ch| ch.is_ascii_digit());
+    if all_digits {
+        return Some(normalized);
+    }
+    let all_upper_alnum = normalized
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || ch.is_ascii_uppercase());
+    if all_upper_alnum && normalized.chars().any(|ch| ch.is_ascii_uppercase()) {
+        return Some(normalized);
+    }
+    None
+}
+
+fn candidate_score(candidate: &str) -> i32 {
+    let len = candidate.len() as i32;
+    let all_digits = candidate.chars().all(|ch| ch.is_ascii_digit());
+    let digit_count = candidate.chars().filter(|ch| ch.is_ascii_digit()).count() as i32;
+    let mut score = if all_digits { 25 } else { 18 };
+    score += digit_count * 2;
+    score -= (len - 6).abs();
+    score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_auth_code;
+
+    #[test]
+    fn detects_numeric_verification_code() {
+        let found = detect_auth_code(
+            "Your login code",
+            "Use verification code 123 456 to finish signing in.",
+        )
+        .map(|code| code.value);
+        assert_eq!(found.as_deref(), Some("123456"));
+    }
+
+    #[test]
+    fn detects_uppercase_alphanumeric_code() {
+        let found = detect_auth_code(
+            "Security alert",
+            "Your one-time passcode is AB12CD. It expires in 10 minutes.",
+        )
+        .map(|code| code.value);
+        assert_eq!(found.as_deref(), Some("AB12CD"));
+    }
+
+    #[test]
+    fn ignores_non_auth_numeric_content() {
+        let found = detect_auth_code(
+            "March invoice",
+            "Invoice 20260309 was generated on 2026-03-09.",
+        );
+        assert!(found.is_none());
+    }
+}
+
 fn find_reference_links(line: &str) -> Vec<(usize, usize)> {
     let bytes = line.as_bytes();
     let mut out = Vec::new();
@@ -2908,7 +3073,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                         Line::from(Span::styled(*line, style))
                     }));
                     lines.push(Line::from(""));
-                    lines.push(Line::from("Links: [l]  Attach: [a]"));
+                    lines.push(Line::from("Links: [l]  Attach: [a]  Copy code: [y]"));
                     Text::from(lines)
                 } else if let Some(err) = render_error {
                     Text::from(vec![
@@ -2933,7 +3098,7 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
                         Line::from("(HTML email rendered as image tiles via kitty/sixel)"),
                         Line::from(""),
                         Line::from(format!("Tiles: {}  (PgDn/PgUp)", render_tile_count)),
-                        Line::from("Links: [l]  Attach: [a]"),
+                        Line::from("Links: [l]  Attach: [a]  Copy code: [y]"),
                     ])
                 }
             }
@@ -3092,34 +3257,6 @@ fn render_message_view(frame: &mut ratatui::Frame, area: Rect, app: &mut App, sc
     }
 }
 
-fn render_help_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
-    let mut help = if app.show_help {
-        String::from(
-            "Tab/h/l focus  j/k move  Space select+next  Enter open/actions  v toggle view  p preview  s sync  o older  / search  [ ] switch acct  ? help  Esc clear\n\
-Ctrl+S/F5 send  r reply  R reply-all  f forward  m move  d delete  (bulk: r read)  q quit",
-        )
-    } else {
-        String::from(
-            "Tab/h/l focus  j/k move  Space select+next  Enter open/actions  v view  p preview  s sync  o older  / search  [ ] acct  ? help  Esc clear  q quit",
-        )
-    };
-    if let Some(msg) = &app.status_message {
-        help.push_str("  |  ");
-        help.push_str(msg);
-    }
-    let block = Block::default()
-        .borders(if app.ui_theme.show_bars {
-            Borders::TOP
-        } else {
-            Borders::NONE
-        })
-        .style(app.ui_theme.bar)
-        .border_style(app.ui_theme.border);
-    frame.render_widget(
-        Paragraph::new(help).style(app.ui_theme.bar).block(block),
-        area,
-    );
-}
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::default()

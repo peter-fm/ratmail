@@ -216,9 +216,9 @@ impl App {
             body,
         });
         if self.compose_attachments.is_empty() {
-            self.status_message = Some("Draft saved".to_string());
+            self.set_status("Draft saved");
         } else {
-            self.status_message = Some("Draft saved (attachments not saved)".to_string());
+            self.set_status("Draft saved (attachments not saved)");
         }
         self.start_compose_new();
         self.mode = Mode::View;
