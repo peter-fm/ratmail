@@ -687,11 +687,13 @@ fn build_html_body(text: &str, config: &SendConfig) -> Option<String> {
     };
     let font_size_px = config.html_font_size_px.clamp(8, 72);
     let style = format!(
-        "font-family: {}; font-size: {}px; line-height: 1.4; white-space: pre-wrap; margin: 0;",
+        "font-family: {}; font-size: {}px; line-height: 1.4; margin: 0;",
         font_family, font_size_px
     );
     let style = encode_double_quoted_attribute(&style);
-    let escaped = encode_safe(text);
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let escaped = encode_safe(&normalized);
+    let escaped = escaped.replace('\n', "<br>\n");
     Some(format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"></head><body><div style=\"{}\">{}</div></body></html>",
         style, escaped
@@ -2679,6 +2681,9 @@ fn detect_auth_code(subject: &str, body: &str) -> Option<AuthCodeMatch> {
         format!("{subject}\n{body}")
     };
     let has_auth_context = contains_auth_keyword(&context);
+    if !has_auth_context {
+        return None;
+    }
     let mut best: Option<AuthCodeMatch> = None;
     for line in context.lines() {
         let line_has_auth = contains_auth_keyword(line);
@@ -2724,28 +2729,23 @@ fn contains_auth_keyword(text: &str) -> bool {
 }
 
 fn auth_code_candidates_in_line(line: &str) -> Vec<String> {
-    let chars: Vec<char> = line.chars().collect();
+    let groups = line
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|group| !group.is_empty())
+        .collect::<Vec<_>>();
+
     let mut out = Vec::new();
-    let mut idx = 0usize;
-    while idx < chars.len() {
-        if !chars[idx].is_ascii_alphanumeric() {
-            idx += 1;
-            continue;
-        }
-        let start = idx;
-        let mut end = idx;
-        while end < chars.len()
-            && (chars[end].is_ascii_alphanumeric() || chars[end] == ' ' || chars[end] == '-')
-        {
-            end += 1;
-        }
-        let raw = chars[start..end].iter().collect::<String>();
-        if let Some(code) = normalize_auth_code_candidate(&raw) {
-            if !out.iter().any(|existing| existing == &code) {
-                out.push(code);
+    let max_groups_per_candidate = 4usize;
+    for start in 0..groups.len() {
+        let mut joined = String::new();
+        for end in start..usize::min(groups.len(), start + max_groups_per_candidate) {
+            joined.push_str(groups[end]);
+            if let Some(code) = normalize_auth_code_candidate(&joined) {
+                if !out.iter().any(|existing| existing == &code) {
+                    out.push(code);
+                }
             }
         }
-        idx = end.saturating_add(1);
     }
     out
 }
@@ -2791,7 +2791,9 @@ fn candidate_score(candidate: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::detect_auth_code;
+    use mailparse::ParsedMail;
+
+    use super::{SendConfig, build_html_body, detect_auth_code};
 
     #[test]
     fn detects_numeric_verification_code() {
@@ -2820,6 +2822,64 @@ mod tests {
             "Invoice 20260309 was generated on 2026-03-09.",
         );
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn build_html_body_uses_br_for_line_breaks() {
+        let config = SendConfig {
+            html: true,
+            html_font_family: "Arial, sans-serif".to_string(),
+            html_font_size_px: 14,
+        };
+        let html = build_html_body("Hi David,\n\nKind regards,\nPete", &config)
+            .expect("html body should be generated");
+        assert!(html.contains("Hi David,<br>"));
+        assert!(html.contains("<br>\n<br>"));
+        assert!(html.contains("Kind regards,<br>"));
+    }
+
+    #[test]
+    fn multipart_mime_preserves_paragraph_breaks_in_plain_and_html_parts() {
+        let config = SendConfig {
+            html: true,
+            html_font_family: "Arial, sans-serif".to_string(),
+            html_font_size_px: 14,
+        };
+        let plain = "Hi David,\n\nKind regards,\nPete";
+        let html = build_html_body(plain, &config).expect("html body should be generated");
+        let raw = format!(
+            "MIME-Version: 1.0\r\n\
+Content-Type: multipart/alternative; boundary=\"rm-test\"\r\n\
+\r\n\
+--rm-test\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+{}\r\n\
+--rm-test\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+{}\r\n\
+--rm-test--\r\n",
+            plain, html
+        );
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("valid multipart message");
+        let plain_part = find_part(&parsed, "text/plain").expect("text/plain part exists");
+        let html_part = find_part(&parsed, "text/html").expect("text/html part exists");
+        let plain_body = plain_part.get_body().expect("plain part body");
+        let html_body = html_part.get_body().expect("html part body");
+        assert!(plain_body.contains("Hi David,\n\nKind regards,\nPete"));
+        assert!(html_body.contains("Hi David,<br>"));
+        assert!(html_body.contains("<br>\n<br>"));
+        assert!(html_body.contains("Kind regards,<br>"));
+    }
+
+    fn find_part<'a>(parsed: &'a ParsedMail<'a>, mime: &str) -> Option<&'a ParsedMail<'a>> {
+        for part in &parsed.subparts {
+            if part.ctype.mimetype.eq_ignore_ascii_case(mime) {
+                return Some(part);
+            }
+        }
+        None
     }
 }
 
