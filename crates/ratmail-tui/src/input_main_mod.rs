@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
-use super::{App, Focus, Mode, ViewMode};
+use super::{App, ComposeStartAction, Focus, Mode, ViewMode};
 
 impl App {
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> bool {
@@ -19,7 +19,8 @@ impl App {
             | Mode::OverlayBulkMove
             | Mode::OverlayConfirmDelete
             | Mode::OverlayConfirmLink
-            | Mode::OverlayConfirmDraft => self.on_key_overlay(key),
+            | Mode::OverlayConfirmDraft
+            | Mode::OverlayConfirmComposeAttachments => self.on_key_overlay(key),
         }
     }
 
@@ -191,13 +192,13 @@ impl App {
                 self.mode = Mode::OverlayAttach;
             }
             (KeyCode::Char('r'), _) => {
-                self.start_compose_reply(false);
+                self.begin_compose_action(ComposeStartAction::Reply);
             }
             (KeyCode::Char('R'), _) => {
-                self.start_compose_reply(true);
+                self.begin_compose_action(ComposeStartAction::ReplyAll);
             }
             (KeyCode::Char('f'), _) => {
-                self.start_compose_forward();
+                self.begin_compose_action(ComposeStartAction::Forward);
             }
             (KeyCode::Char('c'), _) => {
                 self.start_compose_new();

@@ -1,9 +1,9 @@
-use ratmail_content::extract_display;
+use ratmail_content::{extract_attachment_data, extract_display};
 use ratmail_core::{DEFAULT_TEXT_WIDTH, MailStore};
 
 use super::{
-    App, ComposeFocus, ComposeVimMode, Mode, StoreUpdate, build_forward, build_reply,
-    compose_buffer_from_body, draft_headers_from_raw, extract_email, parse_from_addrs,
+    App, ComposeFocus, ComposeStartAction, ComposeVimMode, Mode, StoreUpdate, build_forward,
+    build_reply, compose_buffer_from_body, draft_headers_from_raw, extract_email, parse_from_addrs,
     text_char_len,
 };
 
@@ -22,7 +22,7 @@ impl App {
         self.compose_body = compose_buffer_from_body(self.ui_theme.clone(), "");
         self.compose_quote.clear();
         self.compose_attachments.clear();
-        self.compose_focus = ComposeFocus::From;
+        self.compose_focus = ComposeFocus::To;
         self.compose_cursor_to = 0;
         self.compose_cursor_from = text_char_len(&self.compose_from);
         self.compose_cursor_cc = 0;
@@ -58,12 +58,42 @@ impl App {
         } else if !self.compose_to.is_empty() {
             ComposeFocus::To
         } else {
-            ComposeFocus::From
+            ComposeFocus::To
         };
         self.reset_compose_vim_state();
     }
 
-    pub(crate) fn start_compose_reply(&mut self, reply_all: bool) {
+    pub(crate) fn begin_compose_action(&mut self, action: ComposeStartAction) {
+        self.ensure_attachments_for_selected();
+        let attachment_count = self
+            .selected_detail()
+            .map(|detail| detail.attachments.len())
+            .unwrap_or(0);
+        if attachment_count > 0 {
+            self.confirm_compose_action = Some(action);
+            self.confirm_compose_attachment_count = attachment_count;
+            self.confirm_compose_return = self.mode;
+            self.mode = Mode::OverlayConfirmComposeAttachments;
+            return;
+        }
+        self.execute_compose_action(action, false);
+    }
+
+    pub(crate) fn execute_compose_action(
+        &mut self,
+        action: ComposeStartAction,
+        include_attachments: bool,
+    ) {
+        self.confirm_compose_action = None;
+        self.confirm_compose_attachment_count = 0;
+        match action {
+            ComposeStartAction::Reply => self.start_compose_reply(false, include_attachments),
+            ComposeStartAction::ReplyAll => self.start_compose_reply(true, include_attachments),
+            ComposeStartAction::Forward => self.start_compose_forward(include_attachments),
+        }
+    }
+
+    pub(crate) fn start_compose_reply(&mut self, reply_all: bool, include_attachments: bool) {
         let raw = self.selected_message().and_then(|msg| {
             self.runtime()
                 .block_on(async { self.store_handle.get_raw_body(msg.id).await.ok().flatten() })
@@ -87,6 +117,9 @@ impl App {
         self.compose_body = compose_buffer_from_body(self.ui_theme.clone(), &quote);
         self.compose_quote.clear();
         self.compose_attachments.clear();
+        if include_attachments {
+            self.include_selected_attachments_in_compose();
+        }
         self.compose_focus = ComposeFocus::Body;
         self.compose_cursor_to = text_char_len(&self.compose_to);
         self.compose_cursor_from = text_char_len(&self.compose_from);
@@ -98,7 +131,7 @@ impl App {
         self.mode = Mode::Compose;
     }
 
-    pub(crate) fn start_compose_forward(&mut self) {
+    pub(crate) fn start_compose_forward(&mut self, include_attachments: bool) {
         let raw = self.selected_message().and_then(|msg| {
             self.runtime()
                 .block_on(async { self.store_handle.get_raw_body(msg.id).await.ok().flatten() })
@@ -117,7 +150,10 @@ impl App {
         self.compose_body = compose_buffer_from_body(self.ui_theme.clone(), &body);
         self.compose_quote.clear();
         self.compose_attachments.clear();
-        self.compose_focus = ComposeFocus::From;
+        if include_attachments {
+            self.include_selected_attachments_in_compose();
+        }
+        self.compose_focus = ComposeFocus::To;
         self.compose_cursor_to = 0;
         self.compose_cursor_from = text_char_len(&self.compose_from);
         self.compose_cursor_cc = 0;
@@ -126,6 +162,42 @@ impl App {
         self.compose_body_desired_x = None;
         self.reset_compose_vim_state();
         self.mode = Mode::Compose;
+    }
+
+    fn include_selected_attachments_in_compose(&mut self) {
+        let Some(detail) = self.selected_detail() else {
+            return;
+        };
+        let message_id = detail.id;
+        let expected = detail.attachments.len();
+        if expected == 0 {
+            return;
+        }
+        let raw = match self.get_raw_body_or_fetch(message_id) {
+            Ok(raw) => raw,
+            Err(err) => {
+                self.set_status(format!("Unable to include attachments: {}", err));
+                return;
+            }
+        };
+        let mut added = 0usize;
+        for index in 0..expected {
+            if let Ok(Some(data)) = extract_attachment_data(&raw, index) {
+                let size = data.data.len();
+                self.compose_attachments.push(super::ComposeAttachment {
+                    filename: data.filename,
+                    mime: data.mime,
+                    size,
+                    data: data.data,
+                });
+                added += 1;
+            }
+        }
+        if added == 0 {
+            self.set_status("Unable to include attachments");
+        } else if added < expected {
+            self.set_status(format!("Included {} of {} attachments", added, expected));
+        }
     }
 
     pub(crate) fn start_compose_draft(&mut self) {
@@ -186,10 +258,8 @@ impl App {
             || !self.compose_bcc.is_empty()
         {
             ComposeFocus::To
-        } else if !self.compose_from.is_empty() {
-            ComposeFocus::From
         } else {
-            ComposeFocus::Body
+            ComposeFocus::To
         };
         self.reset_compose_vim_state();
         self.mode = Mode::Compose;

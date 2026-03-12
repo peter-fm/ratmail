@@ -9,7 +9,8 @@ use super::{
     build_html_body, char_index_from_row_col, char_to_byte_idx, collect_spell_issues,
     compose_buffer_from_body, compose_focus_next, compose_focus_prev, compose_move_visual,
     compose_token_at_cursor, cursor_from_char_index, extract_email, format_size, move_cursor_left,
-    move_cursor_right, next_index, parse_from_addrs, prev_index, replace_range_chars,
+    looks_like_email, move_cursor_right, next_index, parse_from_addrs, prev_index,
+    replace_range_chars,
     spell_dictionary, text_char_len, word_at_col,
 };
 
@@ -254,6 +255,12 @@ impl App {
                         key,
                         false,
                     );
+                    if matches!(key.code, KeyCode::Char(' ')) {
+                        maybe_convert_space_separator(
+                            &mut self.compose_to,
+                            &mut self.compose_cursor_to,
+                        );
+                    }
                 }
                 ComposeFocus::Cc => {
                     apply_compose_key(
@@ -262,6 +269,12 @@ impl App {
                         key,
                         false,
                     );
+                    if matches!(key.code, KeyCode::Char(' ')) {
+                        maybe_convert_space_separator(
+                            &mut self.compose_cc,
+                            &mut self.compose_cursor_cc,
+                        );
+                    }
                 }
                 ComposeFocus::Bcc => {
                     apply_compose_key(
@@ -270,6 +283,12 @@ impl App {
                         key,
                         false,
                     );
+                    if matches!(key.code, KeyCode::Char(' ')) {
+                        maybe_convert_space_separator(
+                            &mut self.compose_bcc,
+                            &mut self.compose_cursor_bcc,
+                        );
+                    }
                 }
                 ComposeFocus::Subject => {
                     apply_compose_key(
@@ -385,25 +404,14 @@ impl App {
 
     pub(crate) fn refresh_compose_address_book(&mut self) {
         let mut out = HashSet::new();
-        let account = self.store.account.address.trim();
-        if !account.is_empty() {
-            out.insert(account.to_ascii_lowercase());
-        }
+        add_addresses(&mut out, &self.store.account.address);
         for message in &self.store.messages {
-            for addr in parse_from_addrs(&message.from) {
-                let normalized = addr.trim().to_ascii_lowercase();
-                if !normalized.is_empty() {
-                    out.insert(normalized);
-                }
-            }
+            add_addresses(&mut out, &message.from);
         }
         for detail in self.store.message_details.values() {
-            for addr in parse_from_addrs(&detail.from) {
-                let normalized = addr.trim().to_ascii_lowercase();
-                if !normalized.is_empty() {
-                    out.insert(normalized);
-                }
-            }
+            add_addresses(&mut out, &detail.from);
+            add_addresses(&mut out, &detail.to);
+            add_addresses(&mut out, &detail.cc);
         }
         self.compose_address_list = out.iter().cloned().collect();
         self.compose_address_list.sort();
@@ -853,4 +861,54 @@ fn normalize_sender(raw: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn add_addresses(out: &mut HashSet<String>, raw: &str) {
+    for addr in parse_from_addrs(raw) {
+        let normalized = addr.trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            out.insert(normalized);
+        }
+    }
+}
+
+fn maybe_convert_space_separator(target: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let mut token_end = *cursor;
+    while token_end > 0 {
+        let Some(ch) = target.chars().nth(token_end - 1) else {
+            return;
+        };
+        if ch.is_whitespace() {
+            token_end -= 1;
+            continue;
+        }
+        break;
+    }
+    if token_end == 0 {
+        return;
+    }
+    let mut token_start = token_end;
+    while token_start > 0 {
+        let Some(ch) = target.chars().nth(token_start - 1) else {
+            return;
+        };
+        if ch == ',' || ch == ';' || ch.is_whitespace() {
+            break;
+        }
+        token_start -= 1;
+    }
+    if token_start >= token_end {
+        return;
+    }
+    let token_start_idx = char_to_byte_idx(target, token_start);
+    let token_end_idx = char_to_byte_idx(target, token_end);
+    let token = target[token_start_idx..token_end_idx].trim();
+    if !looks_like_email(token) {
+        return;
+    }
+    replace_range_chars(target, token_end, *cursor, ", ");
+    *cursor = token_end + 2;
 }

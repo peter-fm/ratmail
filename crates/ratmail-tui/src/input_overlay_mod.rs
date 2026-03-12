@@ -2,8 +2,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratmail_core::{LinkInfo, log_debug};
 
 use super::{
-    App, Mode, ViewMode, apply_input_key, copy_with_command, copy_with_osc52, looks_like_email,
-    move_cursor_left, move_cursor_right, next_index, parse_mailto, prev_index, text_char_len,
+    App, ComposeStartAction, Mode, ViewMode, apply_input_key, copy_with_command, copy_with_osc52,
+    looks_like_email, move_cursor_left, move_cursor_right, next_index, parse_mailto, prev_index,
+    text_char_len,
 };
 
 impl App {
@@ -81,13 +82,13 @@ impl App {
                 self.mode = Mode::OverlayAttach;
             }
             (KeyCode::Char('r'), _) => {
-                self.start_compose_reply(false);
+                self.begin_compose_action(ComposeStartAction::Reply);
             }
             (KeyCode::Char('R'), _) => {
-                self.start_compose_reply(true);
+                self.begin_compose_action(ComposeStartAction::ReplyAll);
             }
             (KeyCode::Char('f'), _) => {
-                self.start_compose_forward();
+                self.begin_compose_action(ComposeStartAction::Forward);
             }
             (KeyCode::Char('p'), _) => {
                 self.show_preview = !self.show_preview;
@@ -435,6 +436,28 @@ impl App {
                 }
                 KeyCode::Char('n') => {
                     self.discard_compose();
+                }
+                _ => {}
+            },
+            Mode::OverlayConfirmComposeAttachments => match key.code {
+                KeyCode::Esc => {
+                    self.confirm_compose_action = None;
+                    self.confirm_compose_attachment_count = 0;
+                    self.mode = self.confirm_compose_return;
+                }
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    if let Some(action) = self.confirm_compose_action {
+                        self.execute_compose_action(action, true);
+                    } else {
+                        self.mode = self.confirm_compose_return;
+                    }
+                }
+                KeyCode::Char('n') => {
+                    if let Some(action) = self.confirm_compose_action {
+                        self.execute_compose_action(action, false);
+                    } else {
+                        self.mode = self.confirm_compose_return;
+                    }
                 }
                 _ => {}
             },

@@ -3158,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "ratmail"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3188,7 +3188,7 @@ dependencies = [
 
 [[package]]
 name = "ratmail-content"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -3202,7 +3202,7 @@ dependencies = [
 
 [[package]]
 name = "ratmail-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3215,7 +3215,7 @@ dependencies = [
 
 [[package]]
 name = "ratmail-mail"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3230,7 +3230,7 @@ dependencies = [
 
 [[package]]
 name = "ratmail-render"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",

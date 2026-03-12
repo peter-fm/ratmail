@@ -370,6 +370,50 @@ pub(crate) fn render_confirm_draft_overlay(frame: &mut ratatui::Frame, area: Rec
     frame.render_widget(paragraph, popup);
 }
 
+pub(crate) fn render_confirm_compose_attachments_overlay(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    app: &App,
+) {
+    let popup = centered_rect(62, 38, area);
+    frame.render_widget(Clear, popup);
+
+    let action = match app.confirm_compose_action {
+        Some(super::ComposeStartAction::Reply) => "reply",
+        Some(super::ComposeStartAction::ReplyAll) => "reply all",
+        Some(super::ComposeStartAction::Forward) => "forward",
+        None => "continue",
+    };
+    let count = app.confirm_compose_attachment_count;
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(format!(
+        "This message has {} attachment{}.",
+        count,
+        if count == 1 { "" } else { "s" }
+    )));
+    lines.push(Line::from(format!(
+        "Include original attachment{} when you {}?",
+        if count == 1 { "" } else { "s" },
+        action
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from("y include attachments"));
+    lines.push(Line::from("n do not include"));
+    lines.push(Line::from("Esc cancel"));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("ATTACHMENTS")
+        .style(app.ui_theme.base)
+        .border_style(app.ui_theme.border);
+    let paragraph = Paragraph::new(Text::from(lines))
+        .style(app.ui_theme.base)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
+}
+
 pub(crate) fn render_spellcheck_overlay(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let popup = centered_rect(70, 60, area);
     frame.render_widget(Clear, popup);

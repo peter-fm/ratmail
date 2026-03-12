@@ -74,9 +74,10 @@ use crate::message_parse_mod::{
 };
 use crate::overlay_mod::{
     render_attach_overlay, render_bulk_action_overlay, render_bulk_move_overlay,
-    render_confirm_delete_overlay, render_confirm_draft_overlay, render_confirm_link_overlay,
-    render_help_overlay, render_image_resize_overlay, render_links_overlay, render_toast,
-    render_picker_overlay, render_search_overlay, render_spellcheck_overlay,
+    render_confirm_compose_attachments_overlay, render_confirm_delete_overlay,
+    render_confirm_draft_overlay, render_confirm_link_overlay, render_help_overlay,
+    render_image_resize_overlay, render_links_overlay, render_picker_overlay,
+    render_search_overlay, render_spellcheck_overlay, render_toast,
 };
 use crate::render_mod::{RenderEvent, RenderRequest, render_worker};
 use crate::util_mod::{
@@ -313,6 +314,14 @@ enum Mode {
     OverlayConfirmDelete,
     OverlayConfirmLink,
     OverlayConfirmDraft,
+    OverlayConfirmComposeAttachments,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeStartAction {
+    Reply,
+    ReplyAll,
+    Forward,
 }
 
 #[derive(Debug, Clone)]
@@ -615,6 +624,9 @@ struct App {
     confirm_link: Option<LinkInfo>,
     confirm_link_external: bool,
     confirm_link_return: Mode,
+    confirm_compose_action: Option<ComposeStartAction>,
+    confirm_compose_attachment_count: usize,
+    confirm_compose_return: Mode,
     picker_mode: Option<PickerMode>,
     picker_focus: PickerFocus,
     picker: Option<FileExplorer>,
@@ -2206,6 +2218,9 @@ fn ui(frame: &mut ratatui::Frame, multi: &mut MultiApp) {
         Mode::OverlayConfirmDelete => render_confirm_delete_overlay(frame, area, app),
         Mode::OverlayConfirmLink => render_confirm_link_overlay(frame, area, app),
         Mode::OverlayConfirmDraft => render_confirm_draft_overlay(frame, area, app),
+        Mode::OverlayConfirmComposeAttachments => {
+            render_confirm_compose_attachments_overlay(frame, area, app)
+        }
         Mode::OverlaySpellcheck => render_spellcheck_overlay(frame, area, app),
         Mode::OverlaySearch => render_search_overlay(frame, area, app),
         Mode::Compose => render_compose_overlay(frame, area, app),
