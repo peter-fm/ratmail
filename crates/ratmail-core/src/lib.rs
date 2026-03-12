@@ -751,6 +751,33 @@ impl SqliteMailStore {
             .collect())
     }
 
+    pub async fn list_sent_from_addresses(
+        &self,
+        account_id: i64,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let cap = limit.clamp(1, 1000);
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT DISTINCT m.from_addr
+             FROM messages m
+             JOIN folders f ON f.id = m.folder_id
+             WHERE m.account_id = ?
+               AND m.from_addr <> ''
+               AND (
+                    lower(f.name) LIKE '%sent%'
+                    OR lower(f.name) LIKE '%draft%'
+                    OR lower(f.name) LIKE '%outbox%'
+               )
+             ORDER BY COALESCE(m.date_ts, 0) DESC, m.id DESC
+             LIMIT ?",
+        )
+        .bind(account_id)
+        .bind(cap)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
     pub async fn get_message_summary(&self, message_id: i64) -> Result<Option<MessageSummary>> {
         let row =
             sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, String, i64, String)>(

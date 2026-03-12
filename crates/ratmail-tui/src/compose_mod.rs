@@ -41,12 +41,18 @@ pub(crate) fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
         .split(inner);
 
     let label_style = app.ui_theme.label;
+    let from_label = if app.compose_focus == ComposeFocus::From {
+        app.ui_theme.label_focus
+    } else {
+        label_style
+    };
     let to_label = if app.compose_focus == ComposeFocus::To {
         app.ui_theme.label_focus
     } else {
@@ -67,10 +73,37 @@ pub(crate) fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app
     } else {
         label_style
     };
-    let to_layout = Layout::default()
+    let from_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(6), Constraint::Min(1)])
         .split(rows[0]);
+    frame.render_widget(Paragraph::new("From:").style(from_label), from_layout[0]);
+    let from_suffix = if app.compose_focus == ComposeFocus::From {
+        compose_autocomplete_suffix(
+            &app.compose_sender_list,
+            &app.compose_from,
+            app.compose_cursor_from,
+        )
+    } else {
+        None
+    };
+    let from_line = if let Some(suffix) = from_suffix {
+        Line::from(vec![
+            Span::raw(app.compose_from.as_str()),
+            Span::styled(suffix, app.ui_theme.suffix),
+        ])
+    } else {
+        Line::from(app.compose_from.as_str())
+    };
+    frame.render_widget(
+        Paragraph::new(from_line).style(app.ui_theme.base),
+        from_layout[1],
+    );
+
+    let to_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(rows[1]);
     frame.render_widget(Paragraph::new("To:").style(to_label), to_layout[0]);
     let to_suffix = if app.compose_focus == ComposeFocus::To {
         compose_autocomplete_suffix(
@@ -97,7 +130,7 @@ pub(crate) fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app
     let cc_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(6), Constraint::Min(1)])
-        .split(rows[1]);
+        .split(rows[2]);
     frame.render_widget(Paragraph::new("Cc:").style(cc_label), cc_layout[0]);
     let cc_suffix = if app.compose_focus == ComposeFocus::Cc {
         compose_autocomplete_suffix(
@@ -124,7 +157,7 @@ pub(crate) fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app
     let bcc_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(6), Constraint::Min(1)])
-        .split(rows[2]);
+        .split(rows[3]);
     frame.render_widget(Paragraph::new("Bcc:").style(bcc_label), bcc_layout[0]);
     let bcc_suffix = if app.compose_focus == ComposeFocus::Bcc {
         compose_autocomplete_suffix(
@@ -151,7 +184,7 @@ pub(crate) fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app
     let subject_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(6), Constraint::Min(1)])
-        .split(rows[3]);
+        .split(rows[4]);
     frame.render_widget(
         Paragraph::new("Subj:").style(subject_label),
         subject_layout[0],
@@ -164,7 +197,7 @@ pub(crate) fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app
     let attachment_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(6), Constraint::Min(1)])
-        .split(rows[4]);
+        .split(rows[5]);
     let attachment_text = if app.compose_attachments.is_empty() {
         "(no attachments)".to_string()
     } else {
@@ -183,13 +216,19 @@ pub(crate) fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app
         attachment_layout[1],
     );
 
-    let line = "─".repeat(rows[5].width as usize);
-    frame.render_widget(Paragraph::new(line).style(app.ui_theme.separator), rows[5]);
-    render_compose_body(frame, rows[6], app);
+    let line = "─".repeat(rows[6].width as usize);
+    frame.render_widget(Paragraph::new(line).style(app.ui_theme.separator), rows[6]);
+    render_compose_body(frame, rows[7], app);
 
-    frame.render_widget(Paragraph::new("Ctrl+S send   F1 help").style(app.ui_theme.base), rows[7]);
+    frame.render_widget(Paragraph::new("Ctrl+S send   F1 help").style(app.ui_theme.base), rows[8]);
 
     match app.compose_focus {
+        ComposeFocus::From => set_cursor_at(
+            frame,
+            from_layout[1],
+            &app.compose_from,
+            app.compose_cursor_from,
+        ),
         ComposeFocus::To => {
             set_cursor_at(frame, to_layout[1], &app.compose_to, app.compose_cursor_to)
         }
@@ -209,13 +248,13 @@ pub(crate) fn render_compose_overlay(frame: &mut ratatui::Frame, area: Rect, app
             app.compose_cursor_subject,
         ),
         ComposeFocus::Body => {
-            if let Some(pos) = app.compose_body.cursor_screen_position(rows[6]) {
+            if let Some(pos) = app.compose_body.cursor_screen_position(rows[7]) {
                 frame.set_cursor_position(pos);
             }
         }
     }
 
-    render_inline_spell_suggest(frame, rows[6], app);
+    render_inline_spell_suggest(frame, rows[7], app);
 }
 
 fn render_compose_body(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {

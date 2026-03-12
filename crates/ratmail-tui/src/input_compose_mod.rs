@@ -8,7 +8,7 @@ use super::{
     PickerMode, SpellTarget, VisualMove, add_spell_ignore_word, apply_compose_key, apply_input_key,
     build_html_body, char_index_from_row_col, char_to_byte_idx, collect_spell_issues,
     compose_buffer_from_body, compose_focus_next, compose_focus_prev, compose_move_visual,
-    compose_token_at_cursor, cursor_from_char_index, format_size, move_cursor_left,
+    compose_token_at_cursor, cursor_from_char_index, extract_email, format_size, move_cursor_left,
     move_cursor_right, next_index, parse_from_addrs, prev_index, replace_range_chars,
     spell_dictionary, text_char_len, word_at_col,
 };
@@ -39,6 +39,7 @@ impl App {
                 ))
         {
             let to = self.compose_to.clone();
+            let from = self.compose_from.trim().to_string();
             let cc = self.compose_cc.clone();
             let bcc = self.compose_bcc.clone();
             let subject = self.compose_subject.clone();
@@ -55,9 +56,12 @@ impl App {
                 .collect();
             if to.trim().is_empty() && cc.trim().is_empty() && bcc.trim().is_empty() {
                 self.set_status("No recipient");
+            } else if from.is_empty() {
+                self.set_status("No sender");
             } else {
                 self.set_status("Sending...");
                 let _ = self.engine.send(MailCommand::SendMessage {
+                    from: Some(from),
                     to,
                     cc,
                     bcc,
@@ -191,6 +195,9 @@ impl App {
                 self.compose_focus = compose_focus_next(self.compose_focus);
             }
             (KeyCode::Left, _) => match self.compose_focus {
+                ComposeFocus::From => {
+                    move_cursor_left(&self.compose_from, &mut self.compose_cursor_from);
+                }
                 ComposeFocus::To => {
                     move_cursor_left(&self.compose_to, &mut self.compose_cursor_to);
                 }
@@ -206,11 +213,14 @@ impl App {
                 ComposeFocus::Body => {}
             },
             (KeyCode::Right, _) => match self.compose_focus {
-                ComposeFocus::To | ComposeFocus::Cc | ComposeFocus::Bcc => {
+                ComposeFocus::From | ComposeFocus::To | ComposeFocus::Cc | ComposeFocus::Bcc => {
                     if self.accept_compose_autocomplete() {
                         return false;
                     }
                     match self.compose_focus {
+                        ComposeFocus::From => {
+                            move_cursor_right(&self.compose_from, &mut self.compose_cursor_from);
+                        }
                         ComposeFocus::To => {
                             move_cursor_right(&self.compose_to, &mut self.compose_cursor_to);
                         }
@@ -229,6 +239,14 @@ impl App {
                 ComposeFocus::Body => {}
             },
             _ => match self.compose_focus {
+                ComposeFocus::From => {
+                    apply_compose_key(
+                        &mut self.compose_from,
+                        &mut self.compose_cursor_from,
+                        key,
+                        false,
+                    );
+                }
                 ComposeFocus::To => {
                     apply_compose_key(
                         &mut self.compose_to,
@@ -392,29 +410,105 @@ impl App {
         self.compose_address_book = out;
     }
 
+    pub(crate) fn refresh_compose_sender_book(&mut self) {
+        let mut normalized = HashSet::new();
+        let mut labels = Vec::new();
+        let mut push = |raw: &str| {
+            let Some(trimmed) = normalize_sender(raw) else {
+                return;
+            };
+            let key = trimmed.to_ascii_lowercase();
+            if normalized.insert(key) {
+                labels.push(trimmed);
+            }
+        };
+
+        for sender in self.compose_sender_list.clone() {
+            push(&sender);
+        }
+        push(&self.store.account.address);
+
+        if let Ok(history) = self
+            .runtime()
+            .block_on(self.store_handle.list_sent_from_addresses(self.store.account.id, 128))
+        {
+            for sender in history {
+                push(&sender);
+            }
+        }
+
+        labels.sort_by_key(|s| s.to_ascii_lowercase());
+        self.compose_sender_book = normalized;
+        self.compose_sender_list = labels;
+
+        if self.compose_from.trim().is_empty() {
+            if let Some(default) = self.compose_sender_list.first() {
+                self.compose_from = default.clone();
+                self.compose_cursor_from = text_char_len(&self.compose_from);
+            }
+        }
+    }
+
     fn accept_compose_autocomplete(&mut self) -> bool {
         let (target, cursor) = match self.compose_focus {
+            ComposeFocus::From => (&mut self.compose_from, &mut self.compose_cursor_from),
             ComposeFocus::To => (&mut self.compose_to, &mut self.compose_cursor_to),
             ComposeFocus::Cc => (&mut self.compose_cc, &mut self.compose_cursor_cc),
             ComposeFocus::Bcc => (&mut self.compose_bcc, &mut self.compose_cursor_bcc),
             _ => return false,
         };
-        let Some((_, _, prefix)) = compose_token_at_cursor(target, *cursor) else {
-            return false;
+        let prefix = if self.compose_focus == ComposeFocus::From {
+            if *cursor != text_char_len(target) {
+                return false;
+            }
+            target.trim().to_string()
+        } else {
+            let Some((_, _, prefix)) = compose_token_at_cursor(target, *cursor) else {
+                return false;
+            };
+            prefix
         };
         let prefix_lower = prefix.to_ascii_lowercase();
-        let Some(suggestion) = self
-            .compose_address_list
+        if prefix_lower.is_empty() {
+            return false;
+        }
+        let suggestions = if self.compose_focus == ComposeFocus::From {
+            &self.compose_sender_list
+        } else {
+            &self.compose_address_list
+        };
+        let suggestion = suggestions
             .iter()
-            .find(|addr| addr.starts_with(&prefix_lower) && *addr != &prefix_lower)
+            .find(|candidate| {
+                let lower = candidate.to_ascii_lowercase();
+                lower.starts_with(&prefix_lower) && lower != prefix_lower
+            })
             .cloned()
-        else {
+            .or_else(|| {
+                suggestions.iter().find_map(|candidate| {
+                    let first = parse_from_addrs(candidate).into_iter().next()?;
+                    let lower = first.to_ascii_lowercase();
+                    if lower.starts_with(&prefix_lower) && lower != prefix_lower {
+                        Some(candidate.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+        let Some(suggestion) = suggestion else {
             return false;
         };
-        let suffix = suggestion
-            .chars()
-            .skip(prefix_lower.chars().count())
-            .collect::<String>();
+        let suffix = if self.compose_focus == ComposeFocus::From {
+            suggestion
+                .chars()
+                .skip(prefix.chars().count())
+                .collect::<String>()
+        } else {
+            suggestion
+                .chars()
+                .skip(prefix_lower.chars().count())
+                .collect::<String>()
+        };
         if suffix.is_empty() {
             return false;
         }
@@ -747,5 +841,16 @@ impl App {
             },
         }
         false
+    }
+}
+
+fn normalize_sender(raw: &str) -> Option<String> {
+    let first = parse_from_addrs(raw).into_iter().next();
+    let value = first.unwrap_or_else(|| extract_email(raw));
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }

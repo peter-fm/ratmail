@@ -163,10 +163,17 @@ pub(crate) fn cc_from_raw(raw: &[u8]) -> Option<String> {
     }
 }
 
-pub(crate) fn draft_headers_from_raw(raw: &[u8]) -> (String, String, String, String) {
+pub(crate) fn draft_headers_from_raw(raw: &[u8]) -> (String, String, String, String, String) {
     let Ok(parsed) = mailparse::parse_mail(raw) else {
-        return (String::new(), String::new(), String::new(), String::new());
+        return (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
     };
+    let from = parsed.headers.get_first_value("From").unwrap_or_default();
     let to = parsed.headers.get_first_value("To").unwrap_or_default();
     let cc = parsed.headers.get_first_value("Cc").unwrap_or_default();
     let bcc = parsed.headers.get_first_value("Bcc").unwrap_or_default();
@@ -174,7 +181,7 @@ pub(crate) fn draft_headers_from_raw(raw: &[u8]) -> (String, String, String, Str
         .headers
         .get_first_value("Subject")
         .unwrap_or_default();
-    (to, cc, bcc, subject)
+    (from, to, cc, bcc, subject)
 }
 
 pub(crate) fn extract_email(input: &str) -> String {
@@ -210,7 +217,8 @@ mod tests {
     #[test]
     fn draft_headers_from_raw_reads_all_recipients() {
         let raw = b"From: sender@example.com\r\nTo: to@example.com\r\nCc: cc@example.com\r\nBcc: bcc@example.com\r\nSubject: Hello\r\n\r\nBody";
-        let (to, cc, bcc, subject) = draft_headers_from_raw(raw);
+        let (from, to, cc, bcc, subject) = draft_headers_from_raw(raw);
+        assert_eq!(from, "sender@example.com");
         assert_eq!(to, "to@example.com");
         assert_eq!(cc, "cc@example.com");
         assert_eq!(bcc, "bcc@example.com");

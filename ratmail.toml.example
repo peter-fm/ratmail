@@ -13,6 +13,12 @@ port = 587
 username = "user@example.com"
 password = "app-password-or-smtp-password"
 from = "Your Name <user@example.com>"
+# Optional extra sender identities shown in compose "From" autocomplete.
+# from_addresses = [
+#   "user@example.com",
+#   "alias@example.com",
+#   "Your Team <team@example.com>",
+# ]
 skip_tls_verify = false
 
 [accounts.imap]

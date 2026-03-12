@@ -760,6 +760,7 @@ pub(crate) fn run_cli(
             let (engine, mut events) = rt.block_on(async { MailEngine::start(Some(smtp), None) });
             let body_html = build_html_body(&cmd.body, &send_config);
             let _ = engine.send(MailCommand::SendMessage {
+                from: None,
                 to: cmd.to,
                 cc: cmd.cc.unwrap_or_default(),
                 bcc: cmd.bcc.unwrap_or_default(),

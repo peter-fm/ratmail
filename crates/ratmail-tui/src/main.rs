@@ -394,6 +394,7 @@ enum Focus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposeFocus {
+    From,
     To,
     Cc,
     Bcc,
@@ -512,17 +513,19 @@ fn parse_search_spec(raw: &str) -> SearchSpec {
 
 fn compose_focus_next(current: ComposeFocus) -> ComposeFocus {
     match current {
+        ComposeFocus::From => ComposeFocus::To,
         ComposeFocus::To => ComposeFocus::Cc,
         ComposeFocus::Cc => ComposeFocus::Bcc,
         ComposeFocus::Bcc => ComposeFocus::Subject,
         ComposeFocus::Subject => ComposeFocus::Body,
-        ComposeFocus::Body => ComposeFocus::To,
+        ComposeFocus::Body => ComposeFocus::From,
     }
 }
 
 fn compose_focus_prev(current: ComposeFocus) -> ComposeFocus {
     match current {
-        ComposeFocus::To => ComposeFocus::Body,
+        ComposeFocus::From => ComposeFocus::Body,
+        ComposeFocus::To => ComposeFocus::From,
         ComposeFocus::Cc => ComposeFocus::To,
         ComposeFocus::Bcc => ComposeFocus::Cc,
         ComposeFocus::Subject => ComposeFocus::Bcc,
@@ -636,6 +639,7 @@ struct App {
     imap_status: Option<String>,
     initial_sync_days: i64,
     compose_to: String,
+    compose_from: String,
     compose_cc: String,
     compose_bcc: String,
     compose_subject: String,
@@ -647,6 +651,7 @@ struct App {
     compose_vim_pending: Option<char>,
     compose_focus: ComposeFocus,
     compose_cursor_to: usize,
+    compose_cursor_from: usize,
     compose_cursor_cc: usize,
     compose_cursor_bcc: usize,
     compose_cursor_subject: usize,
@@ -655,6 +660,8 @@ struct App {
     compose_body_area_height: u16,
     compose_address_book: HashSet<String>,
     compose_address_list: Vec<String>,
+    compose_sender_book: HashSet<String>,
+    compose_sender_list: Vec<String>,
     spell_issues: Vec<SpellIssue>,
     spell_issue_index: usize,
     spell_suggestion_index: usize,
@@ -909,7 +916,10 @@ fn compose_autocomplete_suffix(addresses: &[String], text: &str, cursor: usize) 
     let prefix_lower = prefix.to_ascii_lowercase();
     let suggestion = addresses
         .iter()
-        .find(|addr| addr.starts_with(&prefix_lower) && *addr != &prefix_lower)?;
+        .find(|addr| {
+            let lower = addr.to_ascii_lowercase();
+            lower.starts_with(&prefix_lower) && lower != prefix_lower
+        })?;
     let suffix = suggestion
         .chars()
         .skip(prefix_lower.chars().count())
@@ -1715,12 +1725,14 @@ fn main() -> Result<()> {
             db_path: "ratmail-demo-personal.db".to_string(),
             smtp: None,
             imap: None,
+            sender_identities: Vec::new(),
         });
         accounts.push(AccountConfig {
             name: "Work".to_string(),
             db_path: "ratmail-demo-work.db".to_string(),
             smtp: None,
             imap: None,
+            sender_identities: Vec::new(),
         });
     }
     let render_config = load_render_config();
@@ -2109,6 +2121,7 @@ fn main() -> Result<()> {
             ui_theme.clone(),
             send_config.clone(),
             ui_config.compose_vim,
+            account.sender_identities.clone(),
         );
         apps.push(app);
     }
@@ -3369,6 +3382,7 @@ struct AccountConfig {
     db_path: String,
     smtp: Option<SmtpConfig>,
     imap: Option<ImapConfig>,
+    sender_identities: Vec<String>,
 }
 
 fn xdg_config_dir() -> PathBuf {
@@ -3486,6 +3500,7 @@ fn load_accounts_config() -> Vec<AccountConfig> {
         db_path,
         smtp,
         imap,
+        sender_identities: parse_sender_identities(&value),
     }]
 }
 
@@ -3511,7 +3526,46 @@ fn parse_account_config(value: &toml::Value, index: usize) -> Option<AccountConf
         db_path: resolve_db_path(&db_path),
         smtp,
         imap,
+        sender_identities: parse_sender_identities(value),
     })
+}
+
+fn parse_sender_identities(value: &toml::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(smtp) = value.get("smtp") else {
+        return out;
+    };
+    if let Some(primary) = smtp.get("from").and_then(|v| v.as_str()) {
+        if let Some(normalized) = normalize_sender_identity(primary) {
+            out.push(normalized);
+        }
+    }
+    if let Some(list) = smtp.get("from_addresses").and_then(|v| v.as_array()) {
+        for item in list {
+            if let Some(addr) = item.as_str() {
+                if let Some(normalized) = normalize_sender_identity(addr) {
+                    if !out
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(&normalized))
+                    {
+                        out.push(normalized);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn normalize_sender_identity(raw: &str) -> Option<String> {
+    let first = parse_from_addrs(raw).into_iter().next();
+    let value = first.unwrap_or_else(|| extract_email(raw));
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn parse_smtp_config(value: &toml::Value) -> Option<SmtpConfig> {

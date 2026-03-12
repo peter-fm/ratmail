@@ -135,6 +135,7 @@ port = 587
 username = "user@example.com"
 password = "app-password-or-smtp-password"
 from = "Your Name <user@example.com>"
+from_addresses = ["user@example.com", "alias@example.com"]
 skip_tls_verify = false
 
 [render]
@@ -156,6 +157,7 @@ Notes:
 - `ui.theme` controls the TUI palette (`default`, `ratmail`, `nord`, `gruvbox`, `solarized-dark`, `solarized-light`, `dracula`, `catppuccin-mocha`, `catppuccin-latte`, `custom`).
 - `ui.compose_vim = true` enables Vim-style modal editing in the compose body.
 - When `ui.theme = "custom"`, use `[ui.palette]` with hex colors (see `ratmail.toml.example`).
+- `smtp.from_addresses` adds extra sender identities for compose `From` autocomplete.
 
 ## Search (TUI)
 
@@ -299,11 +301,13 @@ port = 587
 username = "you@example.com"
 password = "smtp-password-or-app-password"
 from = "Your Name <you@example.com>"
+from_addresses = ["you@example.com", "alias@example.com"]
 skip_tls_verify = false
 ```
 
 Notes:
 - `from` is the sender label shown to recipients: `Name <email@example.com>`.
+- `from_addresses` is optional and enables quick sender switching in compose.
 - Many providers require app passwords (or provider-specific bridge passwords) instead of your normal login password.
 
 ### Gmail (example)

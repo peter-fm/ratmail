@@ -49,6 +49,7 @@ pub enum MailCommand {
         uids: Vec<u32>,
     },
     SendMessage {
+        from: Option<String>,
         to: String,
         cc: String,
         bcc: String,
@@ -282,6 +283,7 @@ impl MailEngine {
                             .await;
                     }
                     MailCommand::SendMessage {
+                        from,
                         to,
                         cc,
                         bcc,
@@ -293,6 +295,7 @@ impl MailEngine {
                         let _ = evt_tx.send(MailEvent::SendStarted).await;
                         let result = send_smtp(
                             smtp.clone(),
+                            from.as_deref(),
                             &to,
                             &cc,
                             &bcc,
@@ -336,6 +339,7 @@ impl MailEngine {
 
 async fn send_smtp(
     smtp: Option<SmtpConfig>,
+    from: Option<&str>,
     to: &str,
     cc: &str,
     bcc: &str,
@@ -345,7 +349,7 @@ async fn send_smtp(
     attachments: &[OutgoingAttachment],
 ) -> Result<()> {
     let smtp = smtp.ok_or_else(|| anyhow!("SMTP not configured"))?;
-    let from_addr = parse_mailbox(&smtp.from)?;
+    let from_addr = parse_mailbox(from.unwrap_or(&smtp.from))?;
     let to_addrs = parse_mailbox_list(to)?;
     let cc_addrs = parse_mailbox_list(cc)?;
     let bcc_addrs = parse_mailbox_list(bcc)?;

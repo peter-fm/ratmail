@@ -9,7 +9,8 @@ use ratmail_mail::{MailCommand, MailEngine, MailEvent};
 use super::{
     App, ComposeFocus, ComposeVimMode, Focus, IMAP_SPINNER_FRAMES, Mode, PickerFocus,
     PickerPreviewKind, RAT_SPINNER_FRAMES, RenderEvent, RenderRequest, SearchSpec, SendConfig,
-    StoreUpdate, UiTheme, ViewMode, canonical_folder_name, compose_buffer_from_body,
+    StoreUpdate, UiTheme, ViewMode, canonical_folder_name, compose_buffer_from_body, extract_email,
+    parse_from_addrs,
 };
 
 const MAX_MAIL_EVENTS_PER_FRAME: usize = 32;
@@ -42,7 +43,25 @@ impl App {
         ui_theme: Arc<UiTheme>,
         send_config: SendConfig,
         compose_vim_enabled: bool,
+        sender_identities: Vec<String>,
     ) -> Self {
+        let compose_from = sender_identities
+            .first()
+            .cloned()
+            .or_else(|| {
+                let account = store.account.address.trim();
+                if account.is_empty() {
+                    None
+                } else {
+                    Some(
+                        parse_from_addrs(account)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_else(|| extract_email(account)),
+                    )
+                }
+            })
+            .unwrap_or_default();
         let mut app = Self {
             mode: Mode::List,
             focus: Focus::Messages,
@@ -143,6 +162,7 @@ impl App {
             imap_status: None,
             initial_sync_days,
             compose_to: String::new(),
+            compose_from,
             compose_cc: String::new(),
             compose_bcc: String::new(),
             compose_subject: String::new(),
@@ -158,6 +178,7 @@ impl App {
             compose_vim_pending: None,
             compose_focus: ComposeFocus::Body,
             compose_cursor_to: 0,
+            compose_cursor_from: 0,
             compose_cursor_cc: 0,
             compose_cursor_bcc: 0,
             compose_cursor_subject: 0,
@@ -166,6 +187,8 @@ impl App {
             compose_body_area_height: 0,
             compose_address_book: HashSet::new(),
             compose_address_list: Vec::new(),
+            compose_sender_book: HashSet::new(),
+            compose_sender_list: sender_identities,
             spell_issues: Vec::new(),
             spell_issue_index: 0,
             spell_suggestion_index: 0,
@@ -175,6 +198,7 @@ impl App {
         app.select_inbox_if_available();
         app.sort_folders();
         app.refresh_compose_address_book();
+        app.refresh_compose_sender_book();
         if app.imap_enabled {
             let _ = app.engine.send(MailCommand::SyncAll);
             app.imap_pending = app.imap_pending.saturating_add(2);
@@ -282,6 +306,7 @@ impl App {
                     self.text_view_cache_key = None;
                     self.sort_folders();
                     self.refresh_compose_address_book();
+                    self.refresh_compose_sender_book();
                     self.reapply_attachment_cache();
                     self.restore_selection(prev_folder, prev_uid);
                     self.prune_selected_messages();
