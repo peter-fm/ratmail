@@ -44,8 +44,8 @@ pub fn extract_display(raw: &[u8], width_cols: usize) -> Result<DisplayText> {
 
     let text = html_escape::decode_html_entities(&text).to_string();
     let text = normalize_display_text(&text);
-    let links = extract_links(&text, html_for_links.as_deref());
     let text = normalize_bracketed_urls(&text);
+    let links = extract_links(&text, html_for_links.as_deref());
     let text = replace_link_urls_with_labels(&text, &links);
 
     Ok(DisplayText { text, links })
@@ -724,4 +724,43 @@ fn is_rule_char(ch: char) -> bool {
         ch,
         '-' | '_' | '=' | '*' | '~' | '—' | '–' | '─' | '━' | '·' | '•'
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_links_finds_url_after_bracket_normalization() {
+        let wrapped = "[https://drive.google.com/drive/folders/abcd1234\n?usp=sharing][1]";
+        let before = extract_links(wrapped, None);
+        assert_eq!(before.len(), 1);
+        assert_eq!(
+            before[0].url,
+            "https://drive.google.com/drive/folders/abcd1234"
+        );
+
+        let normalized = normalize_bracketed_urls(wrapped);
+        let links = extract_links(&normalized, None);
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].url,
+            "https://drive.google.com/drive/folders/abcd1234?usp=sharing"
+        );
+    }
+
+    #[test]
+    fn extract_links_recovers_when_scheme_is_line_wrapped_in_brackets() {
+        let wrapped = "[https://\ndrive.google.com/drive/folders/abcd1234?usp=sharing][1]";
+        let before = extract_links(wrapped, None);
+        assert!(before.is_empty());
+
+        let normalized = normalize_bracketed_urls(wrapped);
+        let links = extract_links(&normalized, None);
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].url,
+            "https://drive.google.com/drive/folders/abcd1234?usp=sharing"
+        );
+    }
 }
